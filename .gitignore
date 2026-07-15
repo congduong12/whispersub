@@ -1,0 +1,44 @@
+# macOS
+.DS_Store
+
+# Temporary editor files
+*.swp
+*~
+
+# JavaScript / Vite
+node_modules/
+.pnpm-store/
+dist/
+*.local
+*.log
+pnpm-debug.log*
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+worker/.uv-cache/
+
+# IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Harness durable layer
+harness.db
+harness.db-wal
+harness.db-shm
+scripts/bin/harness-cli
+scripts/bin/harness-cli.exe
+
+# Impeccable local runtime state; critique Markdown remains tracked.
+.impeccable/config.local.json
+.impeccable/hook.cache.json
+.impeccable/hook.pending.json
+.impeccable/*.png
+.impeccable/live/server.json

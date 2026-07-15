@@ -1,0 +1,12 @@
+[project]
+name = "whispersub-worker"
+version = "0.1.0"
+description = "Local openai-whisper transcription worker for WhisperSub"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "openai-whisper==20250625",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
