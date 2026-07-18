@@ -6,9 +6,17 @@ import sys
 import unittest
 
 from worker.tests.test_protocol import valid_message
+from worker.main import build_translation_adapter
+from worker.whispersub_worker.gemini_provider import GeminiTranslationAdapter
+from worker.whispersub_worker.openai_provider import OpenAITranslationAdapter
 
 
 class WorkerProcessTest(unittest.TestCase):
+    def test_dispatches_translation_adapter_by_provider(self) -> None:
+        self.assertIsInstance(build_translation_adapter("openai_api"), OpenAITranslationAdapter)
+        self.assertIsInstance(build_translation_adapter("gemini_api"), GeminiTranslationAdapter)
+        self.assertIsNone(build_translation_adapter("none"))
+
     def run_worker(self, line: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "worker.main"],

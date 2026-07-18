@@ -31,7 +31,11 @@ def write_outputs(request: StartJobRequest, segments: list[Segment]) -> list[Pat
 
     destinations = _resolve_destinations(
         output_dir,
-        request.input_path.stem,
+        (
+            request.input_path.stem
+            if request.target_language == "none"
+            else f"{request.input_path.stem}.{request.target_language}"
+        ),
         request.output_formats,
         request.overwrite_policy,
         request.job_id,

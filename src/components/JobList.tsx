@@ -21,16 +21,16 @@ interface JobListProps {
 
 export function JobList({ jobs, onRemove }: JobListProps) {
   if (!jobs.length) {
-      return (
-        <div className="empty-state">
-          <p>File đã chọn sẽ xuất hiện tại đây.</p>
-          <span>SRT được lưu cạnh file gốc · hỗ trợ video và audio phổ biến</span>
-        </div>
-      );
+    return (
+      <div className="empty-state">
+        <p>File đã chọn sẽ xuất hiện tại đây.</p>
+        <span>SRT được lưu cạnh file gốc · hỗ trợ video và audio phổ biến</span>
+      </div>
+    );
   }
 
   return (
-      <div className="job-list" aria-label="Hàng đợi xử lý" aria-live="polite">
+    <div className="job-list" aria-label="Hàng đợi xử lý" aria-live="polite">
       {jobs.map((job, index) => (
         <article className="job-row" key={job.jobId}>
           <div className="job-index">{String(index + 1).padStart(2, "0")}</div>
@@ -39,29 +39,29 @@ export function JobList({ jobs, onRemove }: JobListProps) {
             <span className={`status status-${job.status}`}>
               {statusLabels[job.status]}
             </span>
-              {job.error && (
-                <small className="job-error">
-                  {job.error} Gỡ file rồi thêm lại để thử lại.
-                </small>
-              )}
-            </div>
-            <div
-              className="job-progress"
-              role="progressbar"
-              aria-label={`Tiến trình ${job.fileName}`}
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={Math.round(job.progress)}
-            >
-              <span style={{ transform: `scaleX(${job.progress / 100})` }} />
-            </div>
+            {job.error && (
+              <small className="job-error">
+                {job.error} Gỡ file rồi thêm lại để thử lại.
+              </small>
+            )}
+          </div>
+          <div
+            className="job-progress"
+            role="progressbar"
+            aria-label={`Tiến trình ${job.fileName}`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(job.progress)}
+          >
+            <span style={{ transform: `scaleX(${job.progress / 100})` }} />
+          </div>
           <strong className="progress-number">{Math.round(job.progress)}%</strong>
           <button
             type="button"
             className="remove-button"
             onClick={() => onRemove(job.jobId)}
-            disabled={!['queued', 'completed', 'cancelled', 'failed'].includes(job.status)}
-            aria-label={`Xóa ${job.fileName}`}
+              disabled={!['queued', 'completed', 'cancelled', 'failed'].includes(job.status)}
+              aria-label={`Xóa ${job.fileName}`}
             >
               Xóa
             </button>

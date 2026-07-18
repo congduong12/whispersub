@@ -6,12 +6,19 @@ import {
   listenJobEvents,
   startJob,
 } from "../../lib/tauri";
-import type { JobOptions, StartJobRequest } from "../../lib/types";
+import type { JobOptions } from "../../lib/types";
 import { isJobActive, jobReducer } from "./jobReducer";
+import { buildLocalStartJobRequest } from "./startJobRequest";
+import { getTargetLanguageReadiness, isTargetLanguageReady } from "./targetLanguage";
 
 const defaultOptions: JobOptions = {
   model: "small",
   sourceLanguage: "auto",
+    targetLanguage: "none",
+    translationProvider: "openai",
+    providerAccountFile: null,
+    providerModel: "",
+  translationConsent: false,
   device: "auto",
   includeVtt: false,
 };
@@ -65,35 +72,21 @@ export function useJobQueue() {
       setQueueRunning(false);
       return;
     }
+      if (!isTargetLanguageReady(options)) {
+      setQueueRunning(false);
+      return;
+    }
 
-    const request: StartJobRequest = {
-      type: "start_job",
-      jobId: nextJob.jobId,
-      inputPath: nextJob.inputPath,
-      outputLocationMode: "same_as_input",
-      outputDirectory: null,
-      model: options.model,
-      sourceLanguage: options.sourceLanguage,
-      targetLanguage: "none",
-      task: "transcribe",
-      translationProvider: "none",
-      translationMode: "none",
-      technicalTranslation: false,
-      glossary: null,
-      providerModel: null,
-      device: options.device,
-      outputFormats: options.includeVtt ? ["srt", "vtt"] : ["srt"],
-      overwritePolicy: "suffix",
-    };
+    const request = buildLocalStartJobRequest(nextJob, options);
 
     dispatch({ type: "mark_started", jobId: nextJob.jobId });
-      void startJob(request).catch((error: unknown) => {
+    void startJob(request).catch((error: unknown) => {
       dispatch({
         type: "event_received",
         event: {
           type: "error",
           jobId: nextJob.jobId,
-            code: "WORKER_START_FAILED",
+          code: "WORKER_START_FAILED",
           message: error instanceof Error ? error.message : String(error),
           retryable: true,
         },
@@ -107,7 +100,7 @@ export function useJobQueue() {
 
   const cancelCurrent = useCallback(async () => {
     if (!activeJob) return;
-      await cancelJob(activeJob.jobId);
+    await cancelJob(activeJob.jobId);
   }, [activeJob]);
 
   return {
@@ -116,9 +109,12 @@ export function useJobQueue() {
     options,
     setOptions,
     queueRunning,
+      targetLanguageReadiness: getTargetLanguageReadiness(options),
     addPaths,
     chooseFiles,
-    startQueue: () => setQueueRunning(true),
+    startQueue: () => {
+      if (isTargetLanguageReady(options)) setQueueRunning(true);
+    },
     cancelCurrent,
     removeJob: (jobId: string) => dispatch({ type: "remove_job", jobId }),
     clearFinished: () => dispatch({ type: "clear_finished" }),

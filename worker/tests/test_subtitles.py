@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from worker.tests.test_protocol import valid_message
+from worker.tests.test_protocol import valid_message, valid_translation_message
 from worker.whispersub_worker.engine import Segment
 from worker.whispersub_worker.protocol import WorkerError, parse_start_job
 from worker.whispersub_worker.subtitles import render_srt, render_vtt, write_outputs
@@ -57,6 +57,23 @@ class SubtitleTest(unittest.TestCase):
                 )
 
             self.assertFalse((root / "invalid.srt").exists())
+
+    def test_marks_translated_outputs_with_the_target_language(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "lesson.mp4"
+            input_path.write_bytes(b"fixture")
+            message = valid_translation_message()
+            message["inputPath"] = str(input_path)
+
+            outputs = write_outputs(
+                parse_start_job(message),
+                [Segment(id=0, start=0.0, end=1.0, text="Nội dung đã dịch")],
+            )
+
+            self.assertEqual(
+                [path.name for path in outputs], ["lesson.vi.srt", "lesson.vi.vtt"]
+            )
 
 
 if __name__ == "__main__":

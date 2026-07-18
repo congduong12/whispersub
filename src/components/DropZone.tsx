@@ -11,14 +11,14 @@ export function DropZone({ onChoose, disabled }: DropZoneProps) {
       onClick={onChoose}
       disabled={disabled}
     >
-        <span className="drop-icon" aria-hidden="true">
-          ↓
-        </span>
-        <span>
-          <strong>Chọn video hoặc thả vào đây</strong>
-          <small>Bạn có thể thêm nhiều file trong cùng một lần</small>
-        </span>
-        <span className="choose-chip">Chọn video</span>
-    </button>
+          <span className="drop-icon" aria-hidden="true">
+            ↓
+          </span>
+          <span>
+            <strong>Thêm video hoặc audio</strong>
+            <small>Chọn nhiều file hoặc kéo thả vào đây</small>
+          </span>
+          <span className="choose-chip">Chọn file</span>
+      </button>
   );
 }

@@ -20,9 +20,39 @@ def valid_message() -> dict[str, object]:
         "sourceLanguage": "vi",
         "task": "transcribe",
         "translationProvider": "none",
+        "translationMode": "none",
+        "technicalTranslation": False,
+        "glossary": None,
+        "providerModel": None,
+        "translationConsent": False,
         "device": "auto",
         "outputFormats": ["srt", "vtt", "srt"],
         "overwritePolicy": "suffix",
+    }
+
+
+def valid_translation_message() -> dict[str, object]:
+    return {
+        **valid_message(),
+        "targetLanguage": "vi",
+        "translationProvider": "openai_api",
+        "translationMode": "technical_context",
+        "technicalTranslation": True,
+        "glossary": "software-engineering-default",
+        "providerModel": "gpt-5.6-luna",
+        "providerApiKey": "sk-test-worker-key",
+        "providerBaseUrl": "https://api.openai.com/v1",
+        "translationConsent": True,
+    }
+
+
+def valid_gemini_translation_message() -> dict[str, object]:
+    return {
+        **valid_translation_message(),
+        "translationProvider": "gemini_api",
+        "providerModel": "gemini-3.5-flash",
+        "providerApiKey": "test-gemini-worker-key",
+        "providerBaseUrl": "https://generativelanguage.googleapis.com",
     }
 
 
@@ -47,11 +77,33 @@ class ProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(WorkerError, "SRT output is required"):
             parse_start_job(message)
 
-    def test_rejects_provider_work_in_local_slice(self) -> None:
-        message = valid_message()
-        message["translationProvider"] = "openai_api"
+    def test_parses_consented_openai_translation_runtime(self) -> None:
+        request = parse_start_job(valid_translation_message())
 
-        with self.assertRaisesRegex(WorkerError, "outside the local worker scope"):
+        self.assertEqual(request.target_language, "vi")
+        self.assertEqual(request.translation_provider, "openai_api")
+        self.assertEqual(request.provider_model, "gpt-5.6-luna")
+        self.assertEqual(request.provider_api_key, "sk-test-worker-key")
+
+    def test_parses_consented_gemini_translation_runtime(self) -> None:
+        request = parse_start_job(valid_gemini_translation_message())
+
+        self.assertEqual(request.translation_provider, "gemini_api")
+        self.assertEqual(request.provider_model, "gemini-3.5-flash")
+        self.assertEqual(request.provider_api_key, "test-gemini-worker-key")
+
+    def test_rejects_translation_without_explicit_consent(self) -> None:
+        message = valid_translation_message()
+        message["translationConsent"] = False
+
+        with self.assertRaisesRegex(WorkerError, "consent"):
+            parse_start_job(message)
+
+    def test_rejects_runtime_credentials_on_a_local_only_job(self) -> None:
+        message = valid_message()
+        message["providerApiKey"] = "sk-should-not-be-here"
+
+        with self.assertRaisesRegex(WorkerError, "provider runtime"):
             parse_start_job(message)
 
     def test_error_event_preserves_code_and_retryability(self) -> None:

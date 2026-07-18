@@ -42,11 +42,13 @@ export interface StartJobRequest {
   sourceLanguage: "auto" | "en" | "vi";
   targetLanguage: "none" | "en" | "vi";
   task: "transcribe";
-  translationProvider: "none" | "openai_api";
+    translationProvider: "none" | "openai_api" | "gemini_api";
   translationMode: "none" | "native_whisper" | "technical_context";
   technicalTranslation: boolean;
   glossary: string | null;
+  providerAccountFile: string | null;
   providerModel: string | null;
+  translationConsent: boolean;
   device: "auto" | "mps" | "cpu";
   outputFormats: Array<"srt" | "vtt" | "json">;
   overwritePolicy: "ask" | "suffix" | "overwrite";
@@ -86,6 +88,37 @@ export interface QueuedJob {
 export interface JobOptions {
   model: StartJobRequest["model"];
   sourceLanguage: StartJobRequest["sourceLanguage"];
+    targetLanguage: StartJobRequest["targetLanguage"];
+    translationProvider: Provider;
+    providerAccountFile: string | null;
+  providerModel: string;
+  translationConsent: boolean;
   device: StartJobRequest["device"];
   includeVtt: boolean;
+}
+
+export type Provider = "openai" | "gemini";
+
+export interface ProviderAccountSummary {
+  fileName: string;
+  label: string;
+  provider: Provider;
+  baseUrl: string;
+  isActive: boolean;
+}
+
+export interface ProviderAccountState {
+  accounts: ProviderAccountSummary[];
+  activeAccountFile: string | null;
+  warnings: string[];
+}
+
+export interface ProviderModelSummary {
+  id: string;
+  displayName: string | null;
+}
+
+export interface ProviderConnectionTestResult {
+  outcome: "connected" | "rate_limited";
+  message: string;
 }

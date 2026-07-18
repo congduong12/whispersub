@@ -1,3 +1,4 @@
+use crate::openai_accounts::{Provider, ProviderAccountStore};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -35,10 +36,24 @@ pub struct StartJobRequest {
     translation_mode: String,
     technical_translation: bool,
     glossary: Option<String>,
+    #[serde(skip_serializing)]
+    provider_account_file: Option<String>,
     provider_model: Option<String>,
+    translation_consent: bool,
     device: String,
     output_formats: Vec<String>,
     overwrite_policy: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerStartJobRequest {
+    #[serde(flatten)]
+    request: StartJobRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_base_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -62,6 +77,7 @@ pub fn health_check() -> WorkerHealth {
 pub async fn start_transcription_job(
     app: AppHandle,
     state: State<'_, JobRuntime>,
+    account_store: State<'_, ProviderAccountStore>,
     request: StartJobRequest,
 ) -> Result<(), String> {
     validate_request(&request)?;
@@ -74,6 +90,7 @@ pub async fn start_transcription_job(
             return Err("another transcription job is already active".into());
         }
     }
+    let worker_request = build_worker_request(&request, &account_store)?;
     state
         .cancelled
         .lock()
@@ -81,7 +98,7 @@ pub async fn start_transcription_job(
         .remove(&request.job_id);
 
     let (mut child, stdout, stderr) = spawn_worker(&request)?;
-    let request_line = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    let request_line = serde_json::to_string(&worker_request).map_err(|error| error.to_string())?;
     let mut stdin = child
         .stdin
         .take()
@@ -145,6 +162,7 @@ fn validate_request(request: &StartJobRequest) -> Result<(), String> {
     if request.job_id.trim().is_empty() {
         return Err("jobId must not be empty".into());
     }
+    validate_translation_selection(request)?;
     let input = Path::new(&request.input_path);
     if !input.is_file() {
         return Err(format!(
@@ -152,8 +170,8 @@ fn validate_request(request: &StartJobRequest) -> Result<(), String> {
             request.input_path
         ));
     }
-    if request.task != "transcribe" || request.translation_provider != "none" {
-        return Err("WS-003 only supports local transcription without a provider".into());
+    if request.task != "transcribe" {
+        return Err("task must be transcribe".into());
     }
     if !request.output_formats.iter().any(|value| value == "srt") {
         return Err("SRT output is required".into());
@@ -169,6 +187,81 @@ fn validate_request(request: &StartJobRequest) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_translation_selection(request: &StartJobRequest) -> Result<(), String> {
+    match request.translation_provider.as_str() {
+        "none" => {
+            if request.target_language != "none"
+                || request.translation_mode != "none"
+                || request.technical_translation
+                || request.provider_account_file.is_some()
+                || request.provider_model.is_some()
+                || request.translation_consent
+            {
+                return Err(
+                    "translation fields must be empty when translationProvider is none".into(),
+                );
+            }
+        }
+        "openai_api" | "gemini_api" => {
+            if !matches!(request.target_language.as_str(), "en" | "vi") {
+                return Err("provider translation target must be en or vi".into());
+            }
+            if request.translation_mode != "technical_context" || !request.technical_translation {
+                return Err("provider translation requires technical_context mode".into());
+            }
+            let account_file = request
+                .provider_account_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "providerAccountFile is required for translation".to_string())?;
+            if account_file.chars().any(char::is_control) {
+                return Err("providerAccountFile contains invalid characters".into());
+            }
+            let model = request
+                .provider_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "providerModel is required for translation".to_string())?;
+            if model.chars().count() > 256 || model.chars().any(char::is_control) {
+                return Err("providerModel is invalid".into());
+            }
+            if !request.translation_consent {
+                return Err("explicit translation consent is required".into());
+            }
+        }
+        _ => return Err("unsupported translationProvider".into()),
+    }
+    Ok(())
+}
+
+fn build_worker_request(
+    request: &StartJobRequest,
+    account_store: &ProviderAccountStore,
+) -> Result<WorkerStartJobRequest, String> {
+    let provider = match request.translation_provider.as_str() {
+        "openai_api" => Some(Provider::OpenAi),
+        "gemini_api" => Some(Provider::Gemini),
+        _ => None,
+    };
+    let runtime = match provider {
+        Some(provider) => {
+            let file_name = request
+                .provider_account_file
+                .as_deref()
+                .ok_or_else(|| "providerAccountFile is required for translation".to_string())?;
+            Some(account_store.resolve_runtime_account(provider, file_name)?)
+        }
+        None => None,
+    };
+    Ok(WorkerStartJobRequest {
+        request: request.clone(),
+        provider_api_key: runtime.as_ref().map(|account| account.api_key.clone()),
+        provider_base_url: runtime.map(|account| account.base_url),
+    })
 }
 
 fn spawn_worker(
@@ -229,27 +322,33 @@ fn bridge_worker_events(
     child: Arc<Mutex<Child>>,
     stdout: std::process::ChildStdout,
 ) {
-    let mut terminal_seen = false;
+    // React advances the queue as soon as it receives a terminal event. Keep that
+    // event private until this process has exited and its registry slot is free.
+    let mut pending_terminal_event = None;
     for line in BufReader::new(stdout).lines() {
         let line = match line {
             Ok(line) => line,
             Err(error) => {
-                emit_error(&app, &job_id, "WORKER_IO_FAILED", error.to_string(), true);
-                terminal_seen = true;
+                pending_terminal_event = Some(error_event(
+                    &job_id,
+                    "WORKER_IO_FAILED",
+                    error.to_string(),
+                    true,
+                ));
                 break;
             }
         };
-        match validate_worker_event(&line, &job_id) {
-            Ok((event, terminal)) => {
+        match route_worker_event(&line, &job_id) {
+            Ok(WorkerEventRoute::Emit(event)) => {
                 let _ = app.emit(JOB_EVENT_NAME, event);
-                if terminal {
-                    terminal_seen = true;
-                    break;
-                }
+            }
+            Ok(WorkerEventRoute::DeferTerminal(event)) => {
+                pending_terminal_event = Some(event);
+                break;
             }
             Err(error) => {
-                emit_error(&app, &job_id, "WORKER_PROTOCOL_FAILED", error, false);
-                terminal_seen = true;
+                pending_terminal_event =
+                    Some(error_event(&job_id, "WORKER_PROTOCOL_FAILED", error, false));
                 if let Ok(mut process) = child.lock() {
                     let _ = process.kill();
                 }
@@ -272,24 +371,35 @@ fn bridge_worker_events(
         .map(|mut jobs| jobs.remove(&job_id))
         .unwrap_or(false);
 
-    if !terminal_seen {
+    let terminal_event = pending_terminal_event.unwrap_or_else(|| {
         if cancelled {
-            let _ = app.emit(
-                JOB_EVENT_NAME,
-                serde_json::json!({ "type": "cancelled", "jobId": job_id }),
-            );
+            serde_json::json!({ "type": "cancelled", "jobId": job_id })
         } else {
             let detail = status
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown exit status".into());
-            emit_error(
-                &app,
+            error_event(
                 &job_id,
                 "WORKER_EXITED",
                 format!("worker exited without a terminal event: {detail}"),
                 true,
-            );
+            )
         }
+    });
+    let _ = app.emit(JOB_EVENT_NAME, terminal_event);
+}
+
+enum WorkerEventRoute {
+    Emit(serde_json::Value),
+    DeferTerminal(serde_json::Value),
+}
+
+fn route_worker_event(line: &str, expected_job_id: &str) -> Result<WorkerEventRoute, String> {
+    let (event, terminal) = validate_worker_event(line, expected_job_id)?;
+    if terminal {
+        Ok(WorkerEventRoute::DeferTerminal(event))
+    } else {
+        Ok(WorkerEventRoute::Emit(event))
     }
 }
 
@@ -322,17 +432,14 @@ fn validate_worker_event(
     Ok((event, terminal))
 }
 
-fn emit_error(app: &AppHandle, job_id: &str, code: &str, message: String, retryable: bool) {
-    let _ = app.emit(
-        JOB_EVENT_NAME,
-        serde_json::json!({
-            "type": "error",
-            "jobId": job_id,
-            "code": code,
-            "message": message,
-            "retryable": retryable,
-        }),
-    );
+fn error_event(job_id: &str, code: &str, message: String, retryable: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "jobId": job_id,
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    })
 }
 
 fn forward_stderr(stderr: std::process::ChildStderr, job_id: String) {
@@ -343,10 +450,16 @@ fn forward_stderr(stderr: std::process::ChildStderr, job_id: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{python_candidates, spawn_worker, validate_worker_event, StartJobRequest};
+    use super::{
+        build_worker_request, python_candidates, route_worker_event, spawn_worker,
+        validate_request, validate_worker_event, StartJobRequest, WorkerEventRoute,
+    };
+    use crate::openai_accounts::{Provider, ProviderAccountStore};
     use std::{
+        fs,
         io::{BufRead, BufReader, Write},
         path::Path,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     fn sample_request(input_path: &str) -> StartJobRequest {
@@ -364,7 +477,9 @@ mod tests {
             translation_mode: "none".into(),
             technical_translation: false,
             glossary: None,
+            provider_account_file: None,
             provider_model: None,
+            translation_consent: false,
             device: "auto".into(),
             output_formats: vec!["srt".into()],
             overwrite_policy: "suffix".into(),
@@ -383,6 +498,38 @@ mod tests {
     }
 
     #[test]
+    fn defers_terminal_event_until_worker_cleanup() {
+        let route = route_worker_event(
+            r#"{"type":"completed","jobId":"job_01","outputs":["/tmp/a.srt"]}"#,
+            "job_01",
+        )
+        .expect("terminal event should be valid");
+
+        match route {
+            WorkerEventRoute::DeferTerminal(event) => {
+                assert_eq!(event["type"], "completed");
+            }
+            WorkerEventRoute::Emit(_) => panic!("terminal event must wait for worker cleanup"),
+        }
+    }
+
+    #[test]
+    fn forwards_non_terminal_event_without_waiting_for_cleanup() {
+        let route = route_worker_event(
+            r#"{"type":"progress","jobId":"job_01","phase":"transcribing","percent":50}"#,
+            "job_01",
+        )
+        .expect("progress event should be valid");
+
+        match route {
+            WorkerEventRoute::Emit(event) => assert_eq!(event["type"], "progress"),
+            WorkerEventRoute::DeferTerminal(_) => {
+                panic!("non-terminal event should be forwarded immediately")
+            }
+        }
+    }
+
+    #[test]
     fn rejects_cross_job_event() {
         let error = validate_worker_event(
             r#"{"type":"progress","jobId":"other","phase":"transcribing","percent":1}"#,
@@ -396,6 +543,122 @@ mod tests {
     fn validates_local_only_request() {
         let request = sample_request("/missing.mp4");
         assert!(super::validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn resolves_translation_credentials_only_for_the_worker_request() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "whispersub-worker-translation-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = ProviderAccountStore::new(root.clone());
+        let state = store
+            .create(
+                Provider::OpenAi,
+                "Work",
+                "sk-test-worker-key",
+                "https://api.openai.com/v1",
+            )
+            .expect("account should be created");
+        let input_path = root.join("lesson.mp4");
+        fs::write(&input_path, b"fixture").expect("input fixture should be written");
+        let mut request = sample_request(input_path.to_string_lossy().as_ref());
+        request.target_language = "vi".into();
+        request.translation_provider = "openai_api".into();
+        request.translation_mode = "technical_context".into();
+        request.technical_translation = true;
+        request.glossary = Some("software-engineering-default".into());
+        request.provider_account_file = Some(state.accounts[0].file_name.clone());
+        request.provider_model = Some("gpt-5.6-luna".into());
+        request.translation_consent = true;
+
+        validate_request(&request).expect("consented translation should be valid");
+        let external_json = serde_json::to_string(&request).expect("request should serialize");
+        assert!(!external_json.contains("providerApiKey"));
+        assert!(!external_json.contains("sk-test-worker-key"));
+
+        let worker_request = build_worker_request(&request, &store)
+            .expect("worker request should resolve account runtime");
+        let worker_json =
+            serde_json::to_string(&worker_request).expect("worker request should serialize");
+        assert!(worker_json.contains("providerApiKey"));
+        assert!(worker_json.contains("sk-test-worker-key"));
+        assert!(worker_json.contains("https://api.openai.com/v1"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolves_gemini_runtime_and_rejects_cross_provider_account_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "whispersub-worker-gemini-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = ProviderAccountStore::new(root.clone());
+        let openai = store
+            .create(
+                Provider::OpenAi,
+                "OpenAI",
+                "sk-test-openai-key",
+                "https://api.openai.com/v1",
+            )
+            .expect("OpenAI account should be created");
+        let gemini = store
+            .create(
+                Provider::Gemini,
+                "Gemini",
+                "test-gemini-worker-key",
+                "https://generativelanguage.googleapis.com",
+            )
+            .expect("Gemini account should be created");
+        let input_path = root.join("lesson.mp4");
+        fs::write(&input_path, b"fixture").expect("input fixture should be written");
+        let mut request = sample_request(input_path.to_string_lossy().as_ref());
+        request.target_language = "vi".into();
+        request.translation_provider = "gemini_api".into();
+        request.translation_mode = "technical_context".into();
+        request.technical_translation = true;
+        request.provider_account_file = Some(gemini.accounts[0].file_name.clone());
+        request.provider_model = Some("gemini-3.5-flash".into());
+        request.translation_consent = true;
+
+        validate_request(&request).expect("consented Gemini translation should be valid");
+        let worker_json = serde_json::to_string(
+            &build_worker_request(&request, &store).expect("Gemini runtime should resolve"),
+        )
+        .expect("worker request should serialize");
+        assert!(worker_json.contains("test-gemini-worker-key"));
+        assert!(worker_json.contains("https://generativelanguage.googleapis.com"));
+
+        request.provider_account_file = Some(openai.accounts[0].file_name.clone());
+        let error = build_worker_request(&request, &store)
+            .err()
+            .expect("cross-provider account must fail closed");
+        assert!(error.contains("provider") || error.contains("account"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_translation_without_explicit_consent() {
+        let mut request = sample_request("/missing.mp4");
+        request.target_language = "vi".into();
+        request.translation_provider = "openai_api".into();
+        request.translation_mode = "technical_context".into();
+        request.technical_translation = true;
+        request.provider_account_file = Some("openai_work_1.json".into());
+        request.provider_model = Some("gpt-5.6-luna".into());
+
+        let error = validate_request(&request).expect_err("consent must be required");
+        assert!(error.contains("consent"));
     }
 
     #[test]

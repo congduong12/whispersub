@@ -2,7 +2,7 @@
 
 WhisperSub là ứng dụng desktop local-first cho macOS Apple Silicon, giúp tạo subtitle từ video bằng Whisper. Video và audio được xử lý trên máy; chỉ transcript text mới có thể được gửi tới translation provider khi người dùng chủ động bật và xác nhận.
 
-Repository hiện chứa **Phase 1 scaffold và WS-003 local worker chạy được trong development**:
+Repository hiện chứa **Phase 1 development runtime với local transcription và optional OpenAI/Gemini translation**:
 
 - React 19 + TypeScript + Vite cho UI;
 - Tauri v2 + Rust cho desktop shell và typed command/event IPC;
@@ -10,10 +10,36 @@ Repository hiện chứa **Phase 1 scaffold và WS-003 local worker chạy đư�
 - browser fallback để review UI không cần native runtime;
 - Rust process bridge spawn Python, forward JSONL events và quản lý cancel;
 - Python worker dùng `openai-whisper`, ghi SRT/VTT/JSON atomically và giữ media local;
+- target-language readiness cho phép `Giữ nguyên theo audio`, English hoặc Tiếng
+  Việt; target dịch yêu cầu provider account, model và consent riêng cho batch;
+- điều hướng `Dashboard`/`API key` bằng hash route; workspace API key quản lý
+  OpenAI và Gemini account qua Rust-owned local JSON store tại `~/.whispersub`,
+  gồm thêm/sửa/chọn/xóa mà không trả key về frontend; mỗi account có Base URL
+    tùy chọn với endpoint chính thức được điền sẵn và probe kết nối thủ công trước
+    hoặc sau khi lưu;
 - unit/integration checks cho TypeScript, Python và Rust;
 - Repository Harness v0.1.14 cho feature intake, story/proof tracking và decision log.
 
-Translation provider, Keychain, bundled Python/ffmpeg sidecar và release packaging chưa được nối. Development worker hiện dùng Python virtual environment và ffmpeg có sẵn trên máy; đây chưa phải release artifact tự chứa.
+WS-009 bổ sung nút `Kiểm tra kết nối`: Rust gọi read-only Models API chỉ khi
+người dùng chủ động bấm nút, không gửi media, transcript hoặc generation content.
+Kết nối thành công chỉ xác nhận key/Base URL phản hồi tại thời điểm kiểm tra và
+không thay thế consent dịch. WS-010 nối OpenAI Responses API ở Python worker:
+Rust resolve key ngay trước khi spawn worker, worker chỉ gửi segment `id` +
+`text`, dùng structured output và `store:false`, retry lỗi tạm thời/rate limit tối
+đa ba attempt, rồi ghi subtitle đã dịch với suffix ngôn ngữ như `.vi.srt`.
+WS-011 làm provider thành lựa chọn rõ ràng trong batch, tải model theo account qua
+Rust và nối Gemini Generate Content adapter với cùng ranh giới consent/payload/retry.
+Gemini catalog chỉ hiện model hỗ trợ `generateContent`; OpenAI catalog hiện model
+account nhìn thấy và vẫn cho nhập thủ công cho custom gateway. OpenAI mặc định dùng
+`https://api.openai.com/v1`; Gemini mặc định dùng
+`https://generativelanguage.googleapis.com`. Remote endpoint phải dùng HTTPS;
+HTTP chỉ được phép cho loopback local. API key vẫn được lưu dạng JSON không mã
+hóa với quyền file giới hạn; file mới có tiền tố `openai_` hoặc `gemini_`, còn
+file WS-006 legacy không bị đổi tên. Bundled Python/ffmpeg sidecar và release
+packaging chưa được nối. Development worker
+hiện dùng Python virtual environment và ffmpeg có sẵn trên máy; đây chưa phải
+release artifact tự chứa. Test tự động dùng provider giả lập; smoke với provider
+thật cần credential/quota do người dùng cung cấp.
 
 ## Yêu cầu môi trường
 

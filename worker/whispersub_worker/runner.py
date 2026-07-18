@@ -5,6 +5,7 @@ from collections.abc import Callable
 from worker.whispersub_worker.engine import EventCallback, TranscriptionEngine
 from worker.whispersub_worker.protocol import StartJobRequest, WorkerError
 from worker.whispersub_worker.subtitles import write_outputs
+from worker.whispersub_worker.translation import TranslationProvider
 
 
 def run_job(
@@ -12,11 +13,45 @@ def run_job(
     engine: TranscriptionEngine,
     emit: EventCallback,
     *,
+    translator: TranslationProvider | None = None,
     output_writer: Callable[[StartJobRequest, list], list] = write_outputs,
 ) -> None:
     emit({"type": "job_started", "jobId": request.job_id})
     try:
         segments = engine.transcribe(request, emit)
+        translated = request.translation_provider != "none"
+        if translated:
+            if translator is None:
+                raise WorkerError(
+                    "TRANSLATION_PROVIDER_UNAVAILABLE",
+                    "Translation adapter is not available",
+                    job_id=request.job_id,
+                    retryable=True,
+                )
+            emit(
+                {
+                    "type": "phase_changed",
+                    "jobId": request.job_id,
+                    "phase": "translating",
+                }
+            )
+            emit(
+                {
+                    "type": "progress",
+                    "jobId": request.job_id,
+                    "phase": "translating",
+                    "percent": 92.0,
+                }
+            )
+            segments = translator.translate(request, segments)
+            emit(
+                {
+                    "type": "progress",
+                    "jobId": request.job_id,
+                    "phase": "translating",
+                    "percent": 97.0,
+                }
+            )
         emit(
             {
                 "type": "phase_changed",
@@ -29,7 +64,7 @@ def run_job(
                 "type": "progress",
                 "jobId": request.job_id,
                 "phase": "writing_output",
-                "percent": 95.0,
+                "percent": 98.0 if translated else 95.0,
             }
         )
         outputs = output_writer(request, segments)

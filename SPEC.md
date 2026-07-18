@@ -133,7 +133,7 @@ Các field MVP:
 
 - sourceLanguage: auto, en hoặc vi trong phiên bản đầu.
 - targetLanguage: none, en hoặc vi trong phiên bản đầu.
-- translationProvider: none, openai_api hoặc local_future.
+- translationProvider: none, openai_api, gemini_api hoặc local_future.
 - translationMode: none, native_whisper hoặc technical_context.
 - technicalTranslation: bật/tắt chế độ dịch theo ngữ cảnh software engineering.
 - glossary: danh sách thuật ngữ cần giữ nguyên hoặc mapping riêng.
@@ -153,7 +153,8 @@ Quy tắc:
 - Chế độ technical translation phải giữ nguyên code identifiers, tên API/SDK/CLI, file path, URL, command flag, error code và các thuật ngữ software engineering đã có trong glossary.
 - Timestamp của bản dịch phải kế thừa từ segment gốc; không được làm lệch timeline chỉ vì câu dịch dài hơn.
 - Với provider chưa được cấu hình hoặc chưa hỗ trợ target language, UI phải disable lựa chọn đó và giải thích lý do.
-- Khi translationProvider là openai_api, chỉ gửi transcript text, segment ID và glossary cần thiết; không gửi video/audio.
+- Khi translationProvider là openai_api hoặc gemini_api, chỉ gửi transcript text,
+  segment ID và glossary cần thiết; không gửi video/audio.
 - Khi outputLocationMode là same_as_input, output của mỗi job được lưu cùng thư mục với input tương ứng.
 - Khi outputLocationMode là custom_directory, một thư mục được chọn bằng macOS folder picker và áp dụng cho toàn bộ job trong batch.
 - MVP không hỗ trợ chọn output directory riêng cho từng file trong cùng batch.
@@ -171,7 +172,10 @@ Technical translation là bước sau transcription, không phải một tùy ch
 4. App áp dụng glossary để giữ nguyên hoặc chuẩn hóa các thuật ngữ kỹ thuật.
 5. App xuất bản dịch thành file riêng, ví dụ lesson.vi.srt hoặc lesson.en-tech.srt.
 
-Trong MVP, OpenAI API là provider translation tùy chọn. Nếu người dùng không bật provider, app vẫn tạo transcript/SRT local bình thường. Khi bật OpenAI provider, chỉ transcript text được gửi đi sau khi app hiển thị cảnh báo và người dùng xác nhận.
+Trong MVP, OpenAI API và Gemini API là provider translation tùy chọn. Nếu người
+dùng không bật provider, app vẫn tạo transcript/SRT local bình thường. Khi bật một
+provider, chỉ transcript text được gửi đi sau khi app hiển thị cảnh báo và người
+dùng xác nhận.
 
 ### FR-003B — Provider tab
 
@@ -179,9 +183,10 @@ Provider tab là nơi cấu hình các AI provider, không phải một luồng 
 
 - Local Whisper: provider transcription mặc định, không cần API key.
 - OpenAI API: provider translation cho English và Vietnamese.
+- Gemini API: provider translation cho English và Vietnamese.
 - Local translation: hiển thị là future provider, chưa cần triển khai trong MVP.
 
-OpenAI provider cần có:
+Provider cloud cần có:
 
 - Input API key.
 - Nút Save, Remove và Test connection.
@@ -191,7 +196,11 @@ OpenAI provider cần có:
 - Không ghi API key vào React state lâu dài, localStorage, log hoặc file plain text.
 - Lưu API key trong macOS Keychain; biến môi trường chỉ dùng cho development.
 - Gọi OpenAI từ Rust/Python sidecar, không gọi trực tiếp từ React.
-- Có cảnh báo rằng API usage được tính phí riêng và transcript text sẽ được gửi tới OpenAI khi translation được bật.
+- Có cảnh báo rằng API usage được tính phí riêng và transcript text sẽ được gửi tới
+  provider đã chọn khi translation được bật.
+- Danh sách model được tải theo account mà không đưa key qua React. Gemini chỉ hiện
+  model hỗ trợ `generateContent`; OpenAI cho nhập thủ công vì Models API không công
+  bố capability Responses theo từng model.
 
 Provider interface tối thiểu:
 
@@ -648,7 +657,7 @@ Exit criteria: cài từ artifact release mà không cần Python, Node hoặc f
 - Hai input trùng basename trong custom directory không được ghi đè lẫn nhau.
 - Batch có một file lỗi nhưng các file còn lại vẫn chạy.
 - Queue cancel current và clear pending.
-- OpenAI provider trả về đúng segment ID và giữ timestamp local.
+- OpenAI/Gemini provider trả về đúng segment ID và giữ timestamp local.
 - API timeout/rate limit có retry có giới hạn và lỗi thân thiện.
 - Translation bị tắt thì không có network request nào chứa transcript.
 
@@ -672,7 +681,7 @@ Exit criteria: cài từ artifact release mà không cần Python, Node hoặc f
 - [ ] Có thể chọn nhiều video và xử lý tuần tự trong một batch.
 - [ ] Một file lỗi không làm dừng các file còn lại.
 - [ ] SRT là output bắt buộc; VTT là tùy chọn.
-- [ ] Video/audio không được gửi tới OpenAI; chỉ transcript text được gửi khi user bật translation.
+- [ ] Video/audio không được gửi tới translation provider; chỉ transcript text được gửi khi user bật translation.
 - [ ] API key không xuất hiện trong frontend, log hoặc file plain text.
 - [ ] Translation English/Vietnamese giữ nguyên code identifier và thuật ngữ trong glossary.
 - [ ] Người dùng phải xác nhận trước lần gửi transcript đầu tiên.
