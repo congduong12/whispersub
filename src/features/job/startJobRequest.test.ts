@@ -5,13 +5,15 @@ import { buildLocalStartJobRequest } from "./startJobRequest";
 const baseOptions: JobOptions = {
   model: "small",
   sourceLanguage: "auto",
-    targetLanguage: "none",
-    translationProvider: "openai",
-    providerAccountFile: null,
+  targetLanguage: "none",
+  translationProvider: "openai",
+  providerAccountFile: null,
   providerModel: "gpt-5.6-luna",
   translationConsent: false,
   device: "auto",
   includeVtt: false,
+  outputLocationMode: "same_as_input",
+  outputDirectory: null,
 };
 
 describe("buildLocalStartJobRequest", () => {
@@ -21,7 +23,7 @@ describe("buildLocalStartJobRequest", () => {
         { jobId: "job_local", inputPath: "/video/mixed.mp4" },
         baseOptions,
       ),
-    ).toMatchObject({
+      ).toMatchObject({
         targetLanguage: "none",
         task: "transcribe",
         translationProvider: "none",
@@ -54,6 +56,35 @@ describe("buildLocalStartJobRequest", () => {
       providerModel: "gpt-5.6-luna",
       translationConsent: true,
     });
+  });
+
+  it("applies one custom output directory to the request", () => {
+    expect(
+      buildLocalStartJobRequest(
+        { jobId: "job_custom_output", inputPath: "/video/lesson.mp4" },
+        {
+          ...baseOptions,
+          outputLocationMode: "custom_directory",
+          outputDirectory: "/Users/mac/Movies/Subtitles",
+        },
+      ),
+    ).toMatchObject({
+      outputLocationMode: "custom_directory",
+      outputDirectory: "/Users/mac/Movies/Subtitles",
+    });
+  });
+
+  it("blocks a custom output request without a directory", () => {
+    expect(() =>
+      buildLocalStartJobRequest(
+        { jobId: "job_missing_output", inputPath: "/video/lesson.mp4" },
+        {
+          ...baseOptions,
+          outputLocationMode: "custom_directory",
+          outputDirectory: null,
+        },
+      ),
+    ).toThrow("Chọn thư mục lưu cho batch");
   });
 
   it("builds a consented Gemini translation request", () => {

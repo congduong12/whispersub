@@ -14,11 +14,11 @@ def run_job(
     emit: EventCallback,
     *,
     translator: TranslationProvider | None = None,
+    readiness_check: Callable[[StartJobRequest], None] | None = None,
     output_writer: Callable[[StartJobRequest, list], list] = write_outputs,
 ) -> None:
     emit({"type": "job_started", "jobId": request.job_id})
     try:
-        segments = engine.transcribe(request, emit)
         translated = request.translation_provider != "none"
         if translated:
             if translator is None:
@@ -28,6 +28,10 @@ def run_job(
                     job_id=request.job_id,
                     retryable=True,
                 )
+            if readiness_check is not None:
+                readiness_check(request)
+        segments = engine.transcribe(request, emit)
+        if translated:
             emit(
                 {
                     "type": "phase_changed",

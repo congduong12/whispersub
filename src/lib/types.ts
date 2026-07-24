@@ -36,7 +36,7 @@ export interface StartJobRequest {
   type: "start_job";
   jobId: string;
   inputPath: string;
-  outputLocationMode: "same_as_input" | "custom_directory";
+  outputLocationMode: OutputLocationMode;
   outputDirectory: string | null;
   model: "tiny" | "base" | "small" | "medium" | "turbo";
   sourceLanguage: "auto" | "en" | "vi";
@@ -83,18 +83,38 @@ export interface QueuedJob {
   segments: SubtitleSegment[];
   outputs: string[];
   error: string | null;
+  errorCode: string | null;
 }
 
 export interface JobOptions {
   model: StartJobRequest["model"];
   sourceLanguage: StartJobRequest["sourceLanguage"];
-    targetLanguage: StartJobRequest["targetLanguage"];
-    translationProvider: Provider;
-    providerAccountFile: string | null;
+  targetLanguage: StartJobRequest["targetLanguage"];
+  translationProvider: Provider;
+  providerAccountFile: string | null;
   providerModel: string;
   translationConsent: boolean;
   device: StartJobRequest["device"];
   includeVtt: boolean;
+  outputLocationMode: OutputLocationMode;
+  outputDirectory: string | null;
+}
+
+export type OutputLocationMode = "same_as_input" | "custom_directory";
+
+export type OutputLocationValidationCode =
+  | "NO_INPUTS"
+  | "INVALID_MODE"
+  | "DIRECTORY_REQUIRED"
+  | "DIRECTORY_NOT_ABSOLUTE"
+  | "INPUT_NOT_FOUND"
+  | "DIRECTORY_NOT_FOUND"
+  | "DIRECTORY_NOT_WRITABLE";
+
+export interface OutputLocationValidationResult {
+  valid: boolean;
+  code: OutputLocationValidationCode | null;
+  path: string | null;
 }
 
 export type Provider = "openai" | "gemini";

@@ -85,6 +85,13 @@ Là primary first-run affordance. Có default, hover, focus-visible và disabled
 
 Hiển thị file name, textual status, progress và remove action có accessible label. Progress dùng `role="progressbar"`; dynamic list dùng polite live region. Failed row phải có diagnosis và next action khi engine thật được nối.
 
+Khi batch đi vào terminal state, row cuối không tự vẽ divider nếu completed footer
+đã có divider. Footer đổi sang kết quả thực tế: all-completed dùng `N file đã hoàn
+tất`, còn failed/cancelled dùng outcome tương ứng. `Xóa lịch sử` chỉ dọn các row
+terminal khỏi session queue và không xóa SRT/VTT; `Chọn thêm file` là primary
+continuation sau khi batch kết thúc. Mixed queue chỉ dọn terminal rows, không tác
+động queued/active job.
+
 ### Processing options
 
 Dùng native `details/summary`, mở mặc định để người mới thấy ngay workflow cấu
@@ -110,37 +117,49 @@ queue chạy.
 Affordance của summary dùng nhãn rõ nghĩa `Thu gọn` / `Mở tùy chỉnh` với chevron,
 không dùng dấu cộng xoay thành dấu X. Job list chỉ được cuộn dọc khi vượt chiều
 cao giới hạn; overflow ngang phải bị chặn để tên file/progress không sinh nested
-horizontal scrollbar.
+horizontal scrollbar. File mới luôn append ở cuối để thứ tự hiển thị khớp FIFO.
+Khi người dùng đang ở gần cuối và queue không chạy, list tự reveal batch mới; nếu
+người dùng đang đọc vị trí khác hoặc queue đang chạy, hiển thị action
+`N file mới ở cuối` thay vì cướp vị trí cuộn. Mixed queue summary phải tách riêng
+file đang chạy, file chờ xử lý và terminal history.
 
 ### Provider account manager
 
 Đặt trong destination `API Keys`, tách khỏi processing options. Page hiển thị cảnh
 báo plaintext/path đúng một lần, rồi dùng tab thật cho OpenAI/Gemini và một
 capability section phẳng; không dùng modal hoặc card lồng nhau. Danh sách là các
-row có divider; add/edit dùng form inline. Luôn phân biệt rõ “đã chọn account”
-với “translation đã sẵn sàng” và khóa toàn bộ mutation khi queue đang chạy.
-Dưới API key, form hiển thị Base URL với default chính thức của provider. Đây
-là override nâng cao: người dùng bình thường không phải tự nhập; helper copy nói
-rõ remote URL cần HTTPS và HTTP chỉ dành cho loopback local. Danh sách hiển thị
-  endpoint hiệu lực để người dùng biết key sẽ được định tuyến tới đâu.
-  Form có secondary action `Kiểm tra kết nối` cạnh Save/Cancel. Probe loading phải
-  chặn duplicate action; success, rate-limit warning và error dùng text cùng ARIA
-  semantics. Kết quả cũ bị xóa khi key, Base URL hoặc provider thay đổi. Save
-  không phụ thuộc probe vì custom gateway hoặc outage có thể tạo false negative.
+row có divider; add/edit dùng form inline. Create editor nằm ngay sau provider
+status và trước account list; edit editor nằm liền kề row được chọn. Khi editor mở,
+focus chuyển tới tên hiển thị và được trả về action đã mở editor sau Save/Cancel.
+Hai trường cốt lõi dùng layout hai cột trên desktop và stack một cột dưới 600px.
+Luôn phân biệt rõ “đã chọn account” với “translation đã sẵn sàng” và khóa toàn bộ
+mutation khi queue đang chạy.
+
+Mỗi provider có disclosure `Cách lấy … API key` mở mặc định với ba bước ngắn và
+link chính thức mở bằng Tauri opener trong trình duyệt mặc định. Base URL nằm trong
+disclosure `Tùy chọn nâng cao` đóng mặc định, kèm endpoint hiệu lực và helper copy
+nói rõ remote URL cần HTTPS, HTTP chỉ dành cho loopback local. Danh sách vẫn hiển
+thị endpoint hiệu lực để người dùng biết key sẽ được định tuyến tới đâu. Form có
+secondary action `Kiểm tra kết nối` cạnh Save/Cancel. Probe loading phải chặn
+duplicate action; success, rate-limit warning và error dùng text cùng ARIA
+semantics. Kết quả cũ bị xóa khi key, Base URL hoặc provider thay đổi. Save không
+phụ thuộc probe vì custom gateway hoặc outage có thể tạo false negative.
 Dưới 600px heading, row actions và form actions stack/wrap mà không overflow.
 Empty, loading, error, warning, confirm-delete và success feedback đều phải có
 text/ARIA semantics, không chỉ dùng màu.
 
 ### Actions
 
-Một primary action “Tạo phụ đề”; cancel là danger-secondary. Clear-finished chỉ xuất hiện khi có file hoàn tất.
+Một primary action “Tạo phụ đề”; cancel là danger-secondary. `Xóa lịch sử` là
+outlined danger-secondary và chỉ xuất hiện khi có terminal job. Sau khi toàn bộ
+batch kết thúc, primary continuation đổi thành `Chọn thêm file`.
 
 ## Interaction states
 
 - Idle: drop zone prominent, primary action disabled và giải thích “Chọn video để bắt đầu”.
 - Ready: queue có file, action enabled, current defaults vẫn hiển thị ở settings summary.
 - Running: settings disabled, active file/phase/progress/cancel rõ.
-- Success: textual completion state; clear-finished xuất hiện.
+- Success: textual completion state, output-retention helper và `Xóa lịch sử` xuất hiện.
 - Failure: error text + recovery action; retry đầy đủ được defer tới engine story.
 - Cancel: status phải phân biệt cancelling và cancelled.
 

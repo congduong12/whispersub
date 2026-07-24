@@ -10,10 +10,10 @@ describe("provider account presentation", () => {
       title: "OpenAI · Chưa có tài khoản",
       detail: "Thêm OpenAI account để dùng cho dịch transcript.",
     });
-      expect(getProviderStatus("gemini", "gemini_ca_nhan_1.json", 1)).toEqual({
-        title: "Gemini · Đã chọn tài khoản",
-        detail: "Account sẵn sàng để chọn trên Dashboard; mỗi batch vẫn cần consent.",
-      });
+    expect(getProviderStatus("gemini", "gemini_ca_nhan_1.json", 1)).toEqual({
+      title: "Gemini · Đang dùng tài khoản",
+      detail: "Dashboard sẽ dùng account này; mỗi batch vẫn cần consent.",
+    });
   });
 
   it("distinguishes saved accounts from an active account selection", () => {

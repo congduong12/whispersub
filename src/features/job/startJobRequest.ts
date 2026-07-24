@@ -3,6 +3,7 @@ import type {
   QueuedJob,
   StartJobRequest,
 } from "../../lib/types";
+import { getOutputLocationReadiness } from "./outputLocation";
 import { getTargetLanguageReadiness } from "./targetLanguage";
 
 export function buildLocalStartJobRequest(
@@ -11,19 +12,24 @@ export function buildLocalStartJobRequest(
 ): StartJobRequest {
   const readiness = getTargetLanguageReadiness(options);
   if (!readiness.ready) throw new Error(readiness.reason);
+  const outputReadiness = getOutputLocationReadiness(options);
+  if (!outputReadiness.ready) throw new Error(outputReadiness.reason);
   const translating = options.targetLanguage !== "none";
 
   return {
     type: "start_job",
     jobId: job.jobId,
     inputPath: job.inputPath,
-    outputLocationMode: "same_as_input",
-    outputDirectory: null,
+    outputLocationMode: options.outputLocationMode,
+    outputDirectory:
+      options.outputLocationMode === "custom_directory"
+        ? options.outputDirectory
+        : null,
     model: options.model,
     sourceLanguage: options.sourceLanguage,
     targetLanguage: options.targetLanguage,
     task: "transcribe",
-      translationProvider: translating ? `${options.translationProvider}_api` : "none",
+    translationProvider: translating ? `${options.translationProvider}_api` : "none",
     translationMode: translating ? "technical_context" : "none",
     technicalTranslation: translating,
     glossary: translating ? "software-engineering-default" : null,

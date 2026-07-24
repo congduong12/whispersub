@@ -24,8 +24,8 @@ export function getProviderStatus(
     };
   }
   return {
-    title: `${providerName} · Đã chọn tài khoản`,
-    detail: "Account sẵn sàng để chọn trên Dashboard; mỗi batch vẫn cần consent.",
+    title: `${providerName} · Đang dùng tài khoản`,
+    detail: "Dashboard sẽ dùng account này; mỗi batch vẫn cần consent.",
   };
 }
 

@@ -14,11 +14,12 @@ Repository hiện chứa **Phase 1 development runtime với local transcription
   Việt; target dịch yêu cầu provider account, model và consent riêng cho batch;
 - điều hướng `Dashboard`/`API key` bằng hash route; workspace API key quản lý
   OpenAI và Gemini account qua Rust-owned local JSON store tại `~/.whispersub`,
-  gồm thêm/sửa/chọn/xóa mà không trả key về frontend; mỗi account có Base URL
-    tùy chọn với endpoint chính thức được điền sẵn và probe kết nối thủ công trước
-    hoặc sau khi lưu;
+  gồm thêm/sửa/chọn/xóa mà không trả key về frontend; account active được đồng bộ
+  giữa `API key` và `Dashboard`; mỗi account có Base URL tùy chọn với endpoint
+  chính thức được điền sẵn và probe kết nối thủ công trước hoặc sau khi lưu;
 - unit/integration checks cho TypeScript, Python và Rust;
-- Repository Harness v0.1.14 cho feature intake, story/proof tracking và decision log.
+- Repository Harness core 0.1.7 cho workflow repo-centered và compatibility CLI
+  0.1.22 để giữ lịch sử intake/story/proof/decision hiện có.
 
 WS-009 bổ sung nút `Kiểm tra kết nối`: Rust gọi read-only Models API chỉ khi
 người dùng chủ động bấm nút, không gửi media, transcript hoặc generation content.
@@ -29,6 +30,9 @@ Rust resolve key ngay trước khi spawn worker, worker chỉ gửi segment `id`
 đa ba attempt, rồi ghi subtitle đã dịch với suffix ngôn ngữ như `.vi.srt`.
 WS-011 làm provider thành lựa chọn rõ ràng trong batch, tải model theo account qua
 Rust và nối Gemini Generate Content adapter với cùng ranh giới consent/payload/retry.
+Native worker lifecycle reserve slot atomically trước spawn, đăng ký kill handle
+trước khi gửi JSONL và giữ cancel qua cả trạng thái starting/running; terminal event
+chỉ được publish sau khi process exit và slot đã được giải phóng.
 Gemini catalog chỉ hiện model hỗ trợ `generateContent`; OpenAI catalog hiện model
 account nhìn thấy và vẫn cho nhập thủ công cho custom gateway. OpenAI mặc định dùng
 `https://api.openai.com/v1`; Gemini mặc định dùng

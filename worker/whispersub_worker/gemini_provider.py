@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import sys
 import time
 from collections.abc import Callable
 from random import random
@@ -35,6 +36,39 @@ REFUSAL_REASONS = {
     "SAFETY",
     "SPII",
 }
+SAFE_FINISH_REASONS = REFUSAL_REASONS | {
+    "FINISH_REASON_UNSPECIFIED",
+    "LANGUAGE",
+    "MALFORMED_FUNCTION_CALL",
+    "MALFORMED_RESPONSE",
+    "MAX_TOKENS",
+    "STOP",
+    "UNEXPECTED_TOOL_CALL",
+}
+TOKEN_USAGE_FIELDS = (
+    "cachedContentTokenCount",
+    "candidatesTokenCount",
+    "promptTokenCount",
+    "thoughtsTokenCount",
+    "toolUsePromptTokenCount",
+    "totalTokenCount",
+)
+
+DiagnosticSink = Callable[[dict[str, object]], None]
+
+
+class _InvalidGeminiResponse(WorkerError):
+    def __init__(
+        self, reason: str, job_id: str, diagnostic: dict[str, object] | None = None
+    ) -> None:
+        super().__init__(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Gemini trả về bản dịch không khớp segment local. Không có output nào được publish.",
+            job_id=job_id,
+            retryable=True,
+        )
+        self.reason = reason
+        self.diagnostic = diagnostic or {}
 
 
 class GeminiTranslationAdapter:
@@ -48,6 +82,7 @@ class GeminiTranslationAdapter:
         max_batch_segments: int = MAX_BATCH_SEGMENTS,
         max_batch_characters: int = MAX_BATCH_CHARACTERS,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        diagnostic: DiagnosticSink | None = None,
     ) -> None:
         if max_attempts < 1 or max_batch_segments < 1 or max_batch_characters < 1:
             raise ValueError("Translation limits must be positive")
@@ -58,6 +93,7 @@ class GeminiTranslationAdapter:
         self._max_batch_segments = max_batch_segments
         self._max_batch_characters = max_batch_characters
         self._timeout_seconds = timeout_seconds
+        self._diagnostic = diagnostic or _write_diagnostic
 
     def translate(
         self, request: StartJobRequest, segments: list[Segment]
@@ -71,21 +107,34 @@ class GeminiTranslationAdapter:
         if not segments:
             return []
 
-        translated: list[Segment] = []
-        for batch in _chunk_segments(
+        batches = _chunk_segments(
             segments,
             max_segments=self._max_batch_segments,
             max_characters=self._max_batch_characters,
-        ):
-            translated.extend(self._translate_batch(request, batch))
+        )
+        batch_count = len(batches)
+        translated: list[Segment] = []
+        for batch_index, batch in enumerate(batches, start=1):
+            translated.extend(
+                self._translate_batch(request, batch, batch_index, batch_count)
+            )
         return translated
 
     def _translate_batch(
-        self, request: StartJobRequest, segments: list[Segment]
+        self,
+        request: StartJobRequest,
+        segments: list[Segment],
+        batch_index: int,
+        batch_count: int,
     ) -> list[Segment]:
         provider_request = self._build_request(request, segments)
-        response = self._execute_with_retry(provider_request, request.job_id)
-        return _parse_translations(response.body, request.job_id, segments)
+        return self._execute_with_retry(
+            provider_request,
+            request.job_id,
+            segments,
+            batch_index,
+            batch_count,
+        )
 
     def _build_request(
         self, request: StartJobRequest, segments: list[Segment]
@@ -109,11 +158,20 @@ class GeminiTranslationAdapter:
             "properties": {
                 "segments": {
                     "type": "array",
+                    "minItems": len(segments),
+                    "maxItems": len(segments),
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "integer"},
-                            "text": {"type": "string"},
+                            "id": {
+                                "type": "integer",
+                                "enum": [segment.id for segment in segments],
+                                "description": "ID from the submitted source segment.",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Non-empty translated segment text.",
+                            },
                         },
                         "required": ["id", "text"],
                         "additionalProperties": False,
@@ -165,7 +223,14 @@ class GeminiTranslationAdapter:
             method="POST",
         )
 
-    def _execute_with_retry(self, request: Request, job_id: str) -> HttpResponse:
+    def _execute_with_retry(
+        self,
+        request: Request,
+        job_id: str,
+        source_segments: list[Segment],
+        batch_index: int,
+        batch_count: int,
+    ) -> list[Segment]:
         for attempt in range(self._max_attempts):
             try:
                 response = self._transport(request, self._timeout_seconds)
@@ -181,13 +246,64 @@ class GeminiTranslationAdapter:
                 continue
 
             if 200 <= response.status <= 299:
-                return response
+                try:
+                    return _parse_translations(response.body, job_id, source_segments)
+                except WorkerError as error:
+                    if error.code != "TRANSLATION_INVALID_RESPONSE":
+                        raise
+                    self._record_invalid_response(
+                        error,
+                        attempt,
+                        source_segments,
+                        batch_index,
+                        batch_count,
+                    )
+                    if attempt + 1 >= self._max_attempts:
+                        reason = getattr(error, "reason", "invalid_response_shape")
+                        raise WorkerError(
+                            "TRANSLATION_INVALID_RESPONSE",
+                            (
+                                "Gemini trả về phản hồi không hợp lệ "
+                                f"({reason}; batch {batch_index}/{batch_count}; "
+                                f"attempt {attempt + 1}/{self._max_attempts}). "
+                                "Không có output nào được publish."
+                            ),
+                            job_id=job_id,
+                            retryable=True,
+                        ) from error
+                    self._sleep(self._retry_delay(attempt, None))
+                    continue
             provider_status = _provider_error_status(response.body)
             if response.status in RETRYABLE_STATUSES and attempt + 1 < self._max_attempts:
                 self._sleep(self._retry_delay(attempt, header(response.headers, "retry-after")))
                 continue
             raise _http_error(response.status, provider_status, job_id)
         raise AssertionError("retry loop must return or raise")
+
+    def _record_invalid_response(
+        self,
+        error: WorkerError,
+        attempt: int,
+        source_segments: list[Segment],
+        batch_index: int,
+        batch_count: int,
+    ) -> None:
+        diagnostic = {
+            "event": "gemini_invalid_response",
+            "reason": getattr(error, "reason", "invalid_response_shape"),
+            "attempt": attempt + 1,
+            "maxAttempts": self._max_attempts,
+            "batchIndex": batch_index,
+            "batchCount": batch_count,
+            "segmentCount": len(source_segments),
+            "characterCount": sum(len(segment.text) for segment in source_segments),
+        }
+        if isinstance(error, _InvalidGeminiResponse):
+            diagnostic.update(error.diagnostic)
+        try:
+            self._diagnostic(diagnostic)
+        except Exception:
+            pass
 
     def _retry_delay(self, attempt: int, retry_after: str | None) -> float:
         delay = (2**attempt) * (0.5 + self._random_value())
@@ -250,8 +366,14 @@ def _generate_content_url(base_url: str, model: str, job_id: str) -> str:
 def _parse_translations(
     body: bytes, job_id: str, source_segments: list[Segment]
 ) -> list[Segment]:
+    reason = "invalid_response_json"
+    diagnostic: dict[str, object] = {}
     try:
         response = json.loads(body)
+        reason = "invalid_response_shape"
+        if not isinstance(response, dict):
+            raise ValueError("response must be an object")
+        diagnostic = _response_diagnostic(response)
         prompt_feedback = response.get("promptFeedback") or {}
         if prompt_feedback.get("blockReason"):
             raise WorkerError(
@@ -261,6 +383,7 @@ def _parse_translations(
             )
         candidates = response.get("candidates")
         if not isinstance(candidates, list) or not candidates:
+            reason = "missing_candidates"
             raise ValueError("missing candidates")
         candidate = candidates[0]
         finish_reason = str(candidate.get("finishReason") or "").upper()
@@ -271,29 +394,62 @@ def _parse_translations(
                 job_id=job_id,
             )
         if finish_reason and finish_reason != "STOP":
-            raise ValueError("candidate did not finish normally")
+            safe_finish_reason = _safe_finish_reason(finish_reason)
+            diagnostic["finishReason"] = safe_finish_reason
+            raise _InvalidGeminiResponse(
+                f"finish_{safe_finish_reason.lower()}",
+                job_id,
+                diagnostic,
+            )
         parts = candidate.get("content", {}).get("parts", [])
-        text_parts = [part.get("text") for part in parts if isinstance(part.get("text"), str)]
+        text_parts = [
+            part["text"]
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("thought") is not True
+            and isinstance(part.get("text"), str)
+        ]
         if not text_parts:
+            reason = "missing_text_parts"
             raise ValueError("missing text parts")
+        reason = "invalid_structured_json"
         structured = json.loads("".join(text_parts))
+        reason = "invalid_response_shape"
         values = structured["segments"]
         if not isinstance(values, list):
+            reason = "segments_not_array"
             raise ValueError("segments must be an array")
         translated_by_id: dict[int, str] = {}
         for value in values:
             if not isinstance(value, dict):
+                reason = "invalid_segment_shape"
                 raise ValueError("segment must be an object")
             segment_id = value.get("id")
             text = value.get("text")
             if isinstance(segment_id, bool) or not isinstance(segment_id, int):
+                reason = "invalid_segment_id"
                 raise ValueError("segment id must be an integer")
-            if segment_id in translated_by_id or not isinstance(text, str) or not text.strip():
-                raise ValueError("segment id/text is invalid")
+            if segment_id in translated_by_id:
+                reason = "duplicate_segment_id"
+                raise ValueError("segment id is duplicated")
+            if not isinstance(text, str) or not text.strip():
+                reason = "blank_segment_text"
+                raise ValueError("segment text is invalid")
             translated_by_id[segment_id] = text.strip()
         expected_ids = {segment.id for segment in source_segments}
-        if set(translated_by_id) != expected_ids or len(values) != len(source_segments):
-            raise ValueError("translated segment ids do not match input")
+        actual_ids = set(translated_by_id)
+        if actual_ids != expected_ids or len(values) != len(source_segments):
+            raise _InvalidGeminiResponse(
+                "id_set_mismatch",
+                job_id,
+                {
+                    **diagnostic,
+                    "expectedCount": len(source_segments),
+                    "actualCount": len(values),
+                    "missingIdCount": len(expected_ids - actual_ids),
+                    "unexpectedIdCount": len(actual_ids - expected_ids),
+                },
+            )
         return [
             Segment(
                 id=segment.id,
@@ -305,13 +461,50 @@ def _parse_translations(
         ]
     except WorkerError:
         raise
-    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise WorkerError(
-            "TRANSLATION_INVALID_RESPONSE",
-            "Gemini trả về bản dịch không khớp segment local. Không có output nào được publish.",
-            job_id=job_id,
-            retryable=True,
-        ) from error
+    except json.JSONDecodeError as error:
+        raise _InvalidGeminiResponse(reason, job_id, diagnostic) from error
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise _InvalidGeminiResponse(reason, job_id, diagnostic) from error
+
+
+def _write_diagnostic(diagnostic: dict[str, object]) -> None:
+    print(json.dumps(diagnostic, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+def _response_diagnostic(response: dict[str, object]) -> dict[str, object]:
+    diagnostic: dict[str, object] = {}
+    for key in ("responseId", "modelVersion"):
+        value = _safe_identifier(response.get(key))
+        if value is not None:
+            diagnostic[key] = value
+    usage = response.get("usageMetadata")
+    if isinstance(usage, dict):
+        token_usage = {
+            key: value
+            for key in TOKEN_USAGE_FIELDS
+            if isinstance((value := usage.get(key)), int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
+        if token_usage:
+            diagnostic["tokenUsage"] = token_usage
+    return diagnostic
+
+
+def _safe_identifier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    sanitized = "".join(
+        character
+        for character in value
+        if character.isascii()
+        and (character.isalnum() or character in {"-", "_", ".", ":", "/"})
+    )[:128]
+    return sanitized or None
+
+
+def _safe_finish_reason(value: str) -> str:
+    return value if value in SAFE_FINISH_REASONS else "UNKNOWN"
 
 
 def _provider_error_status(body: bytes) -> str:

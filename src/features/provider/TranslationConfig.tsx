@@ -1,5 +1,9 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
-import { listProviderAccounts, listProviderModels } from "../../lib/tauri";
+import {
+  listProviderAccounts,
+  listProviderModels,
+  setActiveProviderAccount,
+} from "../../lib/tauri";
 import type {
   JobOptions,
   Provider,
@@ -12,6 +16,8 @@ import {
   translationModelGroups,
   ungroupedModelLabel,
 } from "./translationModelCatalog";
+import { normalizeAccountError } from "./accountPresentation";
+import { syncActiveTranslationAccount } from "./translationAccountSelection";
 
 const providerMeta: Record<
   Provider,
@@ -53,6 +59,7 @@ export function TranslationConfig({
 }: TranslationConfigProps) {
   const [accounts, setAccounts] = useState<ProviderAccountSummary[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(true);
+  const [accountChanging, setAccountChanging] = useState(false);
   const [accountsError, setAccountsError] = useState("");
   const [models, setModels] = useState<ProviderModelSummary[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -77,22 +84,9 @@ export function TranslationConfig({
       .then((state) => {
         if (disposed) return;
         setAccounts(state.accounts);
-        setOptions((current) => {
-          if (current.translationProvider !== provider) return current;
-          const selectedStillExists = state.accounts.some(
-            (account) => account.fileName === current.providerAccountFile,
-          );
-          const nextAccount = selectedStillExists
-            ? current.providerAccountFile
-            : state.activeAccountFile ?? state.accounts[0]?.fileName ?? null;
-          if (nextAccount === current.providerAccountFile) return current;
-          return {
-            ...current,
-            providerAccountFile: nextAccount,
-            providerModel: "",
-            translationConsent: false,
-          };
-        });
+        setOptions((current) =>
+          syncActiveTranslationAccount(current, provider, state.activeAccountFile),
+        );
       })
       .catch((error: unknown) => {
         if (disposed) return;
@@ -119,10 +113,10 @@ export function TranslationConfig({
     setModelsLoading(true);
     setModelsError("");
     void listProviderModels(provider, fileName)
-        .then((catalogModels) => {
-          if (disposed) return;
-          const nextModels = curateTranslationModels(provider, catalogModels);
-          setModels(nextModels);
+      .then((catalogModels) => {
+        if (disposed) return;
+        const nextModels = curateTranslationModels(provider, catalogModels);
+        setModels(nextModels);
         setOptions((current) => {
           if (
             current.translationProvider !== provider ||
@@ -131,7 +125,7 @@ export function TranslationConfig({
             return current;
           }
           if (current.providerModel.trim()) return current;
-            const nextModel = defaultTranslationModel(provider, nextModels);
+          const nextModel = defaultTranslationModel(provider, nextModels);
           return nextModel
             ? { ...current, providerModel: nextModel, translationConsent: false }
             : current;
@@ -158,6 +152,25 @@ export function TranslationConfig({
     setOptions({ ...options, providerModel: nextModel, translationConsent: false });
   };
 
+  const selectAccount = async (fileName: string) => {
+    if (!fileName || queueRunning || accountChanging) return;
+    setAccountChanging(true);
+    setAccountsError("");
+    setManualModel(false);
+    setModels([]);
+    try {
+      const state = await setActiveProviderAccount(provider, fileName);
+      setAccounts(state.accounts);
+      setOptions((current) =>
+        syncActiveTranslationAccount(current, provider, state.activeAccountFile),
+      );
+    } catch (error: unknown) {
+      setAccountsError(normalizeAccountError(error));
+    } finally {
+      setAccountChanging(false);
+    }
+  };
+
   return (
     <div className="translation-config" aria-labelledby="translation-config-title">
       <div className="translation-config-heading">
@@ -165,158 +178,157 @@ export function TranslationConfig({
         <span>Media và timestamp không được gửi.</span>
       </div>
 
-        <div className="translation-fields">
-          <label htmlFor="translation-provider">
-            <span>Provider dịch</span>
-            <select
-              id="translation-provider"
-              value={provider}
-              onChange={(event) => {
-                const nextProvider = event.target.value as Provider;
-                setManualModel(false);
-                setModels([]);
-                setModelsError("");
-                setOptions({
-                  ...options,
-                  translationProvider: nextProvider,
-                  providerAccountFile: null,
-                  providerModel: "",
-                  translationConsent: false,
-                });
-              }}
-              disabled={queueRunning}
+      <div className="translation-fields">
+        <label htmlFor="translation-provider">
+          <span>Provider dịch</span>
+          <select
+            id="translation-provider"
+            value={provider}
+            onChange={(event) => {
+              const nextProvider = event.target.value as Provider;
+              setManualModel(false);
+              setModels([]);
+              setModelsError("");
+              setOptions({
+                ...options,
+                translationProvider: nextProvider,
+                providerAccountFile: null,
+                providerModel: "",
+                translationConsent: false,
+              });
+            }}
+            disabled={queueRunning}
             >
               <option value="openai">OpenAI</option>
               <option value="gemini">Gemini</option>
             </select>
-          </label>
+        </label>
 
-          <label htmlFor="translation-account">
-            <span>{meta.name} account</span>
-            <select
-              id="translation-account"
-              value={options.providerAccountFile ?? ""}
-              onChange={(event) => {
-                setManualModel(false);
-                setModels([]);
+        <label htmlFor="translation-account">
+          <span>{meta.name} account đang dùng</span>
+          <select
+            id="translation-account"
+            value={options.providerAccountFile ?? ""}
+            onChange={(event) => {
+              void selectAccount(event.target.value);
+            }}
+            disabled={queueRunning || accountsLoading || accountChanging}
+            aria-busy={accountsLoading || accountChanging}
+          >
+            <option value="" disabled={accounts.length > 0}>
+              {accountsLoading
+                ? "Đang tải account…"
+                : accountChanging
+                  ? "Đang đổi account…"
+                  : `Chọn ${meta.name} account`}
+            </option>
+            {accounts.map((account) => (
+              <option key={account.fileName} value={account.fileName}>
+                {account.label}
+                {account.isActive ? " · đang dùng" : ""}
+              </option>
+            ))}
+          </select>
+          <small className="field-help" aria-live="polite">
+            {accountsError ? (
+              `Không đọc được account: ${accountsError}`
+            ) : accounts.length === 0 && !accountsLoading ? (
+              <>
+                Chưa có {meta.name} account. <a href={meta.accountHref}>Thêm trong API Keys</a>.
+              </>
+            ) : selectedAccount ? (
+              <>
+                Account này được dùng cho Dashboard. API key được Rust đọc khi gọi model/dịch.
+                Endpoint:{" "}
+                <code>{selectedAccount.baseUrl}</code>.
+              </>
+            ) : (
+              "Chọn account để tải model và xem endpoint sẽ nhận transcript."
+            )}
+          </small>
+        </label>
+
+        <label className="translation-model-field" htmlFor="translation-model">
+          <span>Model dịch</span>
+          {manualModel ? (
+            <input
+              id="translation-model"
+              value={options.providerModel}
+              onChange={(event) =>
                 setOptions({
                   ...options,
-                  providerAccountFile: event.target.value || null,
-                  providerModel: "",
+                  providerModel: event.target.value,
                   translationConsent: false,
-                });
-              }}
-              disabled={queueRunning || accountsLoading}
+                })
+              }
+              disabled={queueRunning}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          ) : (
+            <select
+              id="translation-model"
+              value={selectedModelIsListed ? options.providerModel : ""}
+              onChange={(event) =>
+                setOptions({
+                  ...options,
+                  providerModel: event.target.value,
+                  translationConsent: false,
+                })
+              }
+              disabled={queueRunning || modelsLoading || !options.providerAccountFile}
             >
               <option value="">
-                {accountsLoading ? "Đang tải account…" : `Chọn ${meta.name} account`}
+                {modelsLoading ? "Đang tải model…" : "Chọn model"}
               </option>
-              {accounts.map((account) => (
-                <option key={account.fileName} value={account.fileName}>
-                  {account.label}
-                  {account.isActive ? " · đang dùng" : ""}
-                </option>
-              ))}
-            </select>
-            <small className="field-help" aria-live="polite">
-              {accountsError ? (
-                `Không đọc được account: ${accountsError}`
-              ) : accounts.length === 0 && !accountsLoading ? (
-                <>
-              Chưa có {meta.name} account. <a href={meta.accountHref}>Thêm trong API Keys</a>.
-                </>
-              ) : selectedAccount ? (
-                <>
-                  API key được Rust đọc khi gọi model/dịch. Endpoint: {" "}
-                  <code>{selectedAccount.baseUrl}</code>.
-                </>
-              ) : (
-                "Chọn account để tải model và xem endpoint sẽ nhận transcript."
-              )}
-            </small>
-          </label>
-
-          <label className="translation-model-field" htmlFor="translation-model">
-            <span>Model dịch</span>
-            {manualModel ? (
-              <input
-                id="translation-model"
-                value={options.providerModel}
-                onChange={(event) =>
-                  setOptions({
-                    ...options,
-                    providerModel: event.target.value,
-                    translationConsent: false,
-                  })
-                }
-                disabled={queueRunning}
-                autoComplete="off"
-                spellCheck={false}
-              />
-            ) : (
-              <select
-                id="translation-model"
-                value={selectedModelIsListed ? options.providerModel : ""}
-                onChange={(event) =>
-                  setOptions({
-                    ...options,
-                    providerModel: event.target.value,
-                    translationConsent: false,
-                  })
-                }
-                disabled={queueRunning || modelsLoading || !options.providerAccountFile}
-              >
-                <option value="">
-                  {modelsLoading ? "Đang tải model…" : "Chọn model"}
-                </option>
-                  {provider === "gemini"
-                    ? modelGroups.map((group) => (
-                        <optgroup key={group.id} label={group.label}>
-                          {group.options.map((option) => (
-                            <option key={option.model.id} value={option.model.id}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </optgroup>
-                      ))
-                    : models.map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {ungroupedModelLabel(model)}
+              {provider === "gemini"
+                ? modelGroups.map((group) => (
+                    <optgroup key={group.id} label={group.label}>
+                      {group.options.map((option) => (
+                        <option key={option.model.id} value={option.model.id}>
+                          {option.label}
                         </option>
                       ))}
-              </select>
+                    </optgroup>
+                  ))
+                : models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {ungroupedModelLabel(model)}
+                    </option>
+                  ))}
+            </select>
+          )}
+          <div className="translation-model-actions">
+            <button
+              type="button"
+              className="inline-action-button"
+              onClick={() => setModelRefresh((value) => value + 1)}
+              disabled={queueRunning || modelsLoading || !options.providerAccountFile}
+            >
+              Tải lại model
+            </button>
+            <button
+              type="button"
+              className="inline-action-button"
+              onClick={() => (manualModel ? useCatalogModel() : setManualModel(true))}
+              disabled={queueRunning}
+            >
+              {manualModel ? "Dùng danh sách account" : "Nhập model thủ công"}
+            </button>
+          </div>
+          <small className="field-help" aria-live="polite">
+            {modelsError ? (
+              `Không tải được model: ${modelsError} Bạn vẫn có thể nhập model thủ công.`
+            ) : !modelsLoading && options.providerAccountFile && models.length === 0 ? (
+              `Account không trả về model phù hợp cho ${meta.generationApi}.`
+            ) : provider === "gemini" ? (
+              "Chỉ hiện model dịch đã xác minh. Tải danh sách không gửi prompt hoặc transcript."
+            ) : (
+              "Models API chỉ cho biết model account nhìn thấy; hỗ trợ Responses sẽ được xác nhận khi chạy."
             )}
-            <div className="translation-model-actions">
-              <button
-                type="button"
-                className="inline-action-button"
-                onClick={() => setModelRefresh((value) => value + 1)}
-                disabled={queueRunning || modelsLoading || !options.providerAccountFile}
-              >
-                Tải lại model
-              </button>
-              <button
-                type="button"
-                className="inline-action-button"
-                onClick={() => (manualModel ? useCatalogModel() : setManualModel(true))}
-                disabled={queueRunning}
-              >
-                {manualModel ? "Dùng danh sách account" : "Nhập model thủ công"}
-              </button>
-            </div>
-            <small className="field-help" aria-live="polite">
-              {modelsError ? (
-                `Không tải được model: ${modelsError} Bạn vẫn có thể nhập model thủ công.`
-              ) : !modelsLoading && options.providerAccountFile && models.length === 0 ? (
-                `Account không trả về model phù hợp cho ${meta.generationApi}.`
-                ) : provider === "gemini" ? (
-                  "Chỉ hiện model dịch đã xác minh. Tải danh sách không gửi prompt hoặc transcript."
-              ) : (
-                "Models API chỉ cho biết model account nhìn thấy; hỗ trợ Responses sẽ được xác nhận khi chạy."
-              )}
-            </small>
-          </label>
-        </div>
+          </small>
+        </label>
+      </div>
 
       <label className="translation-consent" htmlFor="translation-consent">
         <input

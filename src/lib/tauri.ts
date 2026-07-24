@@ -1,5 +1,6 @@
 import type {
   JobEvent,
+  OutputLocationValidationResult,
   Provider,
   ProviderAccountState,
     ProviderAccountSummary,
@@ -32,7 +33,15 @@ function emitBrowserEvent(event: JobEvent): void {
 
 function scheduleBrowserMock(request: StartJobRequest): void {
   const translating = request.targetLanguage !== "none";
-  const outputBase = `${request.inputPath.replace(/\.[^/.]+$/, "")}${
+  const inputStem = request.inputPath
+    .split(/[\\/]/)
+    .pop()
+    ?.replace(/\.[^/.]+$/, "");
+  const outputDirectory =
+    request.outputLocationMode === "custom_directory" && request.outputDirectory
+      ? request.outputDirectory.replace(/[\\/]+$/, "")
+      : request.inputPath.replace(/[\\/][^\\/]+$/, "");
+  const outputBase = `${outputDirectory}/${inputStem ?? "subtitle"}${
     translating ? `.${request.targetLanguage}` : ""
   }`;
   const events: Array<[number, JobEvent]> = [
@@ -368,6 +377,46 @@ export async function chooseVideoPaths(): Promise<string[]> {
       );
     };
     input.click();
+  });
+}
+
+export async function chooseOutputDirectory(): Promise<string | null> {
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selection = await open({
+      title: "Chọn thư mục lưu phụ đề",
+      multiple: false,
+      directory: true,
+    });
+    if (!selection) return null;
+    return Array.isArray(selection) ? (selection[0] ?? null) : selection;
+  }
+
+  return "/browser-preview/Subtitles";
+}
+
+export async function validateOutputLocations(
+  inputPaths: string[],
+  outputLocationMode: StartJobRequest["outputLocationMode"],
+  outputDirectory: string | null,
+): Promise<OutputLocationValidationResult> {
+  if (!isTauriRuntime()) {
+    if (inputPaths.length === 0) {
+      return { valid: false, code: "NO_INPUTS", path: null };
+    }
+    if (outputLocationMode === "custom_directory" && !outputDirectory?.trim()) {
+      return { valid: false, code: "DIRECTORY_REQUIRED", path: null };
+    }
+    return { valid: true, code: null, path: null };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<OutputLocationValidationResult>("validate_output_locations", {
+    request: {
+      inputPaths,
+      outputLocationMode,
+      outputDirectory,
+    },
   });
 }
 

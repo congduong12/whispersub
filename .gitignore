@@ -42,3 +42,13 @@ scripts/bin/harness-cli.exe
 .impeccable/hook.pending.json
 .impeccable/*.png
 .impeccable/live/server.json
+
+# Harness core maintenance binary
+scripts/bin/harness
+scripts/bin/harness.exe
+
+# Harness local runtime and installer backups; core provenance stays tracked.
+.harness-backup/
+.harness/*
+!.harness/changesets/
+!.harness/changesets/*.changeset.jsonl

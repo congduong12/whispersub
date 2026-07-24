@@ -15,6 +15,32 @@ describe("jobReducer", () => {
     ]);
   });
 
+  it("appends a new batch after terminal history without changing FIFO order", () => {
+    let jobs = jobReducer([], {
+      type: "add_paths",
+      paths: ["/video/lesson-1.mp4", "/video/lesson-2.mp4"],
+    });
+    jobs = jobReducer(jobs, {
+      type: "event_received",
+      event: {
+        type: "completed",
+        jobId: jobs[0].jobId,
+        outputs: ["/video/lesson-1.srt"],
+      },
+    });
+    jobs = jobReducer(jobs, {
+      type: "add_paths",
+      paths: ["/video/lesson-3.mp4"],
+    });
+
+    expect(jobs.map((job) => job.fileName)).toEqual([
+      "lesson-1.mp4",
+      "lesson-2.mp4",
+      "lesson-3.mp4",
+    ]);
+    expect(jobs[2].status).toBe("queued");
+  });
+
   it("moves a job through progress and completion events", () => {
     const [queued] = jobReducer([], {
       type: "add_paths",
@@ -47,6 +73,58 @@ describe("jobReducer", () => {
       progress: 100,
       outputs: ["/video/lesson.srt"],
     });
+  });
+
+  it("clears only terminal history and preserves queued or active jobs", () => {
+    let jobs = jobReducer([], {
+      type: "add_paths",
+      paths: [
+        "/video/completed.mp4",
+        "/video/failed.mp4",
+        "/video/cancelled.mp4",
+        "/video/active.mp4",
+        "/video/queued.mp4",
+      ],
+    });
+
+    jobs = jobReducer(jobs, {
+      type: "event_received",
+      event: {
+        type: "completed",
+        jobId: jobs[0].jobId,
+        outputs: ["/video/completed.srt"],
+      },
+    });
+    jobs = jobReducer(jobs, {
+      type: "event_received",
+      event: {
+        type: "error",
+        jobId: jobs[1].jobId,
+        code: "TRANSLATION_FAILED",
+        message: "Translation failed",
+        retryable: false,
+      },
+    });
+    jobs = jobReducer(jobs, {
+      type: "event_received",
+      event: { type: "cancelled", jobId: jobs[2].jobId },
+    });
+    jobs = jobReducer(jobs, {
+      type: "mark_started",
+      jobId: jobs[3].jobId,
+    });
+
+    const remainingJobs = jobReducer(jobs, { type: "clear_finished" });
+
+    expect(remainingJobs.map((job) => job.fileName)).toEqual([
+      "active.mp4",
+      "queued.mp4",
+    ]);
+      expect(remainingJobs.map((job) => job.status)).toEqual([
+      "preparing",
+      "queued",
+      ]);
+      expect(jobs[1].errorCode).toBe("TRANSLATION_FAILED");
   });
 });
 

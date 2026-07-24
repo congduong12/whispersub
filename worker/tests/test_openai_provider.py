@@ -32,6 +32,57 @@ class OpenAITranslationAdapterTest(unittest.TestCase):
             Segment(id=8, start=2.5, end=4.0, text="Run pnpm check"),
         ]
 
+    def test_preflight_uses_fixed_synthetic_content_without_user_data(self) -> None:
+        captured: list[Request] = []
+
+        def transport(request: Request, _timeout: float) -> HttpResponse:
+            captured.append(request)
+            return HttpResponse(200, {}, b'{"status":"completed"}')
+
+        OpenAITranslationAdapter(transport=transport).preflight(self.request)
+
+        self.assertEqual(len(captured), 1)
+        payload = json.loads(captured[0].data or b"{}")
+        self.assertEqual(payload["model"], self.request.provider_model)
+        self.assertEqual(
+            payload["input"],
+            "WhisperSub readiness check. Return the requested JSON only.",
+        )
+        self.assertFalse(payload["store"])
+        self.assertTrue(payload["text"]["format"]["strict"])
+        self.assertEqual(payload["max_output_tokens"], 32)
+        serialized_payload = json.dumps(payload)
+        self.assertNotIn(str(self.request.input_path), serialized_payload)
+        self.assertNotIn("Deploy the API", serialized_payload)
+        self.assertNotIn("Run pnpm check", serialized_payload)
+        self.assertNotIn("sk-test-worker-key", serialized_payload)
+        self.assertNotIn("segments", serialized_payload)
+        self.assertEqual(
+            captured[0].get_header("Authorization"),
+            "Bearer sk-test-worker-key",
+        )
+
+    def test_preflight_maps_quota_without_retrying_or_exposing_provider_body(self) -> None:
+        attempts = 0
+
+        def transport(_request: Request, _timeout: float) -> HttpResponse:
+            nonlocal attempts
+            attempts += 1
+            return HttpResponse(
+                429,
+                {},
+                b'{"error":{"code":"insufficient_quota","message":"secret provider detail"}}',
+            )
+
+        with self.assertRaises(WorkerError) as raised:
+            OpenAITranslationAdapter(transport=transport).preflight(self.request)
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(raised.exception.code, "OPENAI_BILLING_NOT_READY")
+        self.assertIn("Whisper chưa được chạy", str(raised.exception))
+        self.assertNotIn("secret provider detail", str(raised.exception))
+        self.assertFalse(raised.exception.retryable)
+
     def test_sends_only_segment_ids_and_text_with_store_disabled(self) -> None:
         captured: list[Request] = []
 

@@ -55,6 +55,27 @@ class OpenAITranslationAdapter:
         self._max_batch_characters = max_batch_characters
         self._timeout_seconds = timeout_seconds
 
+    def preflight(self, request: StartJobRequest) -> None:
+        if request.translation_provider != "openai_api":
+            raise WorkerError(
+                "INVALID_REQUEST",
+                "OpenAI adapter received a different provider",
+                job_id=request.job_id,
+            )
+        try:
+            self._execute_with_retry(
+                self._build_preflight_request(request),
+                request.job_id,
+            )
+        except WorkerError as error:
+            if error.code == "TRANSLATION_QUOTA_EXCEEDED":
+                raise WorkerError(
+                    "OPENAI_BILLING_NOT_READY",
+                    "OpenAI chưa cho phép tạo response vì billing/credit không khả dụng. Whisper chưa được chạy.",
+                    job_id=request.job_id,
+                ) from error
+            raise
+
     def translate(
         self, request: StartJobRequest, segments: list[Segment]
     ) -> list[Segment]:
@@ -86,15 +107,7 @@ class OpenAITranslationAdapter:
     def _build_request(
         self, request: StartJobRequest, segments: list[Segment]
     ) -> Request:
-        api_key = request.provider_api_key
-        base_url = request.provider_base_url
-        model = request.provider_model
-        if not api_key or not base_url or not model:
-            raise WorkerError(
-                "INVALID_REQUEST",
-                "OpenAI runtime configuration is incomplete",
-                job_id=request.job_id,
-            )
+        api_key, base_url, model = _runtime_config(request)
         target_name = "Vietnamese" if request.target_language == "vi" else "English"
         provider_input = {
             "targetLanguage": request.target_language,
@@ -136,15 +149,43 @@ class OpenAITranslationAdapter:
                 }
             },
         }
-        return Request(
-            _responses_url(base_url, request.job_id),
-            data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
+        return _provider_request(
+            base_url=base_url,
+            api_key=api_key,
+            job_id=request.job_id,
+            payload=payload,
+        )
+
+    def _build_preflight_request(self, request: StartJobRequest) -> Request:
+        api_key, base_url, model = _runtime_config(request)
+        payload = {
+            "model": model,
+            "instructions": (
+                "Return JSON matching the schema. This is a capability check using "
+                "only fixed WhisperSub content."
+            ),
+            "input": "WhisperSub readiness check. Return the requested JSON only.",
+            "max_output_tokens": 32,
+            "store": False,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "whispersub_readiness",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ready": {"type": "boolean"}},
+                        "required": ["ready"],
+                        "additionalProperties": False,
+                    },
+                }
             },
-            method="POST",
+        }
+        return _provider_request(
+            base_url=base_url,
+            api_key=api_key,
+            job_id=request.job_id,
+            payload=payload,
         )
 
     def _execute_with_retry(self, request: Request, job_id: str) -> HttpResponse:
@@ -208,6 +249,38 @@ def _chunk_segments(
     if current:
         batches.append(current)
     return batches
+
+
+def _runtime_config(request: StartJobRequest) -> tuple[str, str, str]:
+    api_key = request.provider_api_key
+    base_url = request.provider_base_url
+    model = request.provider_model
+    if not api_key or not base_url or not model:
+        raise WorkerError(
+            "INVALID_REQUEST",
+            "OpenAI runtime configuration is incomplete",
+            job_id=request.job_id,
+        )
+    return api_key, base_url, model
+
+
+def _provider_request(
+    *,
+    base_url: str,
+    api_key: str,
+    job_id: str,
+    payload: dict[str, Any],
+) -> Request:
+    return Request(
+        _responses_url(base_url, job_id),
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
 
 
 def _responses_url(base_url: str, job_id: str) -> str:
@@ -347,4 +420,3 @@ def _http_error(status: int, provider_code: str, job_id: str) -> WorkerError:
         f"OpenAI từ chối translation request (HTTP {status}). Kiểm tra model và Base URL.",
         job_id=job_id,
     )
-

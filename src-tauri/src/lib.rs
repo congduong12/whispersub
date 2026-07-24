@@ -6,7 +6,10 @@ use openai_accounts::{
     set_active_provider_account, test_provider_connection, update_provider_account,
     ProviderAccountStore,
 };
-use worker_job::{cancel_transcription_job, health_check, start_transcription_job, JobRuntime};
+use worker_job::{
+    cancel_transcription_job, health_check, start_transcription_job, validate_output_locations,
+    JobRuntime,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,6 +30,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             health_check,
+            validate_output_locations,
             start_transcription_job,
             cancel_transcription_job,
             list_provider_accounts,

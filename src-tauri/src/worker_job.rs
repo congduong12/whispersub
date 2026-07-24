@@ -1,22 +1,356 @@
 use crate::openai_accounts::{Provider, ProviderAccountStore};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     env,
+    fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const JOB_EVENT_NAME: &str = "whispersub://job-event";
 
+type WorkerHandle = Arc<Mutex<Child>>;
+
+enum WorkerLifecycle<T> {
+    Idle,
+    Starting {
+        job_id: String,
+        worker: Option<T>,
+        cancel_requested: bool,
+    },
+    Running {
+        job_id: String,
+        worker: T,
+        cancel_requested: bool,
+    },
+}
+
+impl<T> Default for WorkerLifecycle<T> {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl<T> WorkerLifecycle<T> {
+    fn reserve_start(&mut self, job_id: &str) -> Result<(), String> {
+        if !matches!(self, Self::Idle) {
+            return Err("another transcription job is already active".into());
+        }
+        *self = Self::Starting {
+            job_id: job_id.into(),
+            worker: None,
+            cancel_requested: false,
+        };
+        Ok(())
+    }
+
+    fn register_starting_worker(&mut self, job_id: &str, new_worker: T) -> Result<bool, String> {
+        match self {
+            Self::Starting {
+                job_id: active_job_id,
+                worker,
+                cancel_requested,
+            } if active_job_id == job_id => {
+                if worker.is_some() {
+                    return Err("worker is already registered for this start".into());
+                }
+                *worker = Some(new_worker);
+                Ok(*cancel_requested)
+            }
+            _ => Err("worker start reservation is no longer active".into()),
+        }
+    }
+
+    fn commit_start(&mut self, job_id: &str) -> Result<bool, String> {
+        match self {
+            Self::Starting {
+                job_id: active_job_id,
+                worker,
+                cancel_requested,
+            } if active_job_id == job_id => {
+                let cancel_requested = *cancel_requested;
+                let worker = worker
+                    .take()
+                    .ok_or_else(|| "worker has not been registered for this start".to_string())?;
+                *self = Self::Running {
+                    job_id: job_id.into(),
+                    worker,
+                    cancel_requested,
+                };
+                Ok(cancel_requested)
+            }
+            _ => Err("worker start reservation is no longer active".into()),
+        }
+    }
+
+    fn rollback_start(&mut self, job_id: &str) {
+        if matches!(self, Self::Starting { job_id: active_job_id, .. } if active_job_id == job_id) {
+            *self = Self::Idle;
+        }
+    }
+
+    fn request_cancel(&mut self, job_id: &str) -> Option<&T> {
+        match self {
+            Self::Starting {
+                job_id: active_job_id,
+                worker,
+                cancel_requested,
+            } if active_job_id == job_id => {
+                *cancel_requested = true;
+                worker.as_ref()
+            }
+            Self::Running {
+                job_id: active_job_id,
+                worker,
+                cancel_requested,
+            } if active_job_id == job_id => {
+                *cancel_requested = true;
+                Some(worker)
+            }
+            _ => None,
+        }
+    }
+
+    fn finish(&mut self, job_id: &str) -> Option<bool> {
+        let cancelled = match self {
+            Self::Running {
+                job_id: active_job_id,
+                cancel_requested,
+                ..
+            } if active_job_id == job_id => Some(*cancel_requested),
+            _ => None,
+        };
+        if cancelled.is_some() {
+            *self = Self::Idle;
+        }
+        cancelled
+    }
+}
+
 #[derive(Default)]
 pub struct JobRuntime {
-    workers: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
-    cancelled: Mutex<HashSet<String>>,
+    lifecycle: Mutex<WorkerLifecycle<WorkerHandle>>,
+}
+
+impl JobRuntime {
+    fn reserve_start(&self, job_id: &str) -> Result<StartReservation<'_>, String> {
+        self.lifecycle
+            .lock()
+            .map_err(|_| "job runtime lock poisoned")?
+            .reserve_start(job_id)?;
+        Ok(StartReservation {
+            runtime: self,
+            job_id: job_id.into(),
+            committed: false,
+        })
+    }
+
+    fn request_cancel(&self, job_id: &str) -> Result<Option<WorkerHandle>, String> {
+        Ok(self
+            .lifecycle
+            .lock()
+            .map_err(|_| "job runtime lock poisoned")?
+            .request_cancel(job_id)
+            .cloned())
+    }
+
+    fn finish(&self, job_id: &str) -> Result<bool, String> {
+        Ok(self
+            .lifecycle
+            .lock()
+            .map_err(|_| "job runtime lock poisoned")?
+            .finish(job_id)
+            .unwrap_or(false))
+    }
+}
+
+struct StartReservation<'a> {
+    runtime: &'a JobRuntime,
+    job_id: String,
+    committed: bool,
+}
+
+impl StartReservation<'_> {
+    fn register_worker(&self, worker: WorkerHandle) -> Result<bool, String> {
+        self.runtime
+            .lifecycle
+            .lock()
+            .map_err(|_| "job runtime lock poisoned")?
+            .register_starting_worker(&self.job_id, worker)
+    }
+
+    fn cancel_requested(&self) -> Result<bool, String> {
+        let lifecycle = self
+            .runtime
+            .lifecycle
+            .lock()
+            .map_err(|_| "job runtime lock poisoned")?;
+        match &*lifecycle {
+            WorkerLifecycle::Starting {
+                job_id,
+                cancel_requested,
+                ..
+            } if job_id == &self.job_id => Ok(*cancel_requested),
+            _ => Err("worker start reservation is no longer active".into()),
+        }
+    }
+
+    fn commit(mut self) -> Result<bool, String> {
+        let cancel_requested = self
+            .runtime
+            .lifecycle
+            .lock()
+            .map_err(|_| "job runtime lock poisoned")?
+            .commit_start(&self.job_id)?;
+        self.committed = true;
+        Ok(cancel_requested)
+    }
+}
+
+impl Drop for StartReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(mut lifecycle) = self.runtime.lifecycle.lock() {
+                lifecycle.rollback_start(&self.job_id);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateOutputLocationsRequest {
+    input_paths: Vec<String>,
+    output_location_mode: String,
+    output_directory: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputLocationValidationResult {
+    valid: bool,
+    code: Option<String>,
+    path: Option<String>,
+}
+
+impl OutputLocationValidationResult {
+    fn valid() -> Self {
+        Self {
+            valid: true,
+            code: None,
+            path: None,
+        }
+    }
+
+    fn invalid(code: &str, path: Option<&Path>) -> Self {
+        Self {
+            valid: false,
+            code: Some(code.into()),
+            path: path.map(|value| value.to_string_lossy().into_owned()),
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn validate_output_locations(
+    request: ValidateOutputLocationsRequest,
+) -> Result<OutputLocationValidationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || validate_output_locations_blocking(request))
+        .await
+        .map_err(|error| format!("failed to validate output locations: {error}"))
+}
+
+fn validate_output_locations_blocking(
+    request: ValidateOutputLocationsRequest,
+) -> OutputLocationValidationResult {
+    if request.input_paths.is_empty() {
+        return OutputLocationValidationResult::invalid("NO_INPUTS", None);
+    }
+
+    let mut input_directories = HashSet::new();
+    for input_path in &request.input_paths {
+        let input = Path::new(input_path);
+        if !input.is_file() {
+            return OutputLocationValidationResult::invalid("INPUT_NOT_FOUND", Some(input));
+        }
+        let Some(parent) = input.parent() else {
+            return OutputLocationValidationResult::invalid("INPUT_NOT_FOUND", Some(input));
+        };
+        input_directories.insert(parent.to_path_buf());
+    }
+
+    let directories = match request.output_location_mode.as_str() {
+        "same_as_input" => input_directories,
+        "custom_directory" => {
+            let Some(output_directory) = request
+                .output_directory
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+            else {
+                return OutputLocationValidationResult::invalid("DIRECTORY_REQUIRED", None);
+            };
+            if !output_directory.is_absolute() {
+                return OutputLocationValidationResult::invalid(
+                    "DIRECTORY_NOT_ABSOLUTE",
+                    Some(&output_directory),
+                );
+            }
+            HashSet::from([output_directory])
+        }
+        _ => return OutputLocationValidationResult::invalid("INVALID_MODE", None),
+    };
+
+    for directory in directories {
+        if !directory.is_dir() {
+            return OutputLocationValidationResult::invalid(
+                "DIRECTORY_NOT_FOUND",
+                Some(&directory),
+            );
+        }
+        if !directory_accepts_probe_file(&directory) {
+            return OutputLocationValidationResult::invalid(
+                "DIRECTORY_NOT_WRITABLE",
+                Some(&directory),
+            );
+        }
+    }
+
+    OutputLocationValidationResult::valid()
+}
+
+fn directory_accepts_probe_file(directory: &Path) -> bool {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    for attempt in 0..4 {
+        let probe_path = directory.join(format!(
+            ".whispersub-write-probe-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(file) => {
+                drop(file);
+                return fs::remove_file(probe_path).is_ok();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        }
+    }
+
+    false
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,45 +415,61 @@ pub async fn start_transcription_job(
     request: StartJobRequest,
 ) -> Result<(), String> {
     validate_request(&request)?;
-    {
-        let workers = state
-            .workers
-            .lock()
-            .map_err(|_| "job runtime lock poisoned")?;
-        if !workers.is_empty() {
-            return Err("another transcription job is already active".into());
+    let reservation = state.reserve_start(&request.job_id)?;
+    let worker_request = build_worker_request(&request, &account_store)?;
+
+    let request_line = serde_json::to_string(&worker_request).map_err(|error| error.to_string())?;
+    let (child, stdout, stderr) = spawn_worker(&request)?;
+    let child = Arc::new(Mutex::new(child));
+    let cancelled_before_delivery = match reservation.register_worker(Arc::clone(&child)) {
+        Ok(cancel_requested) => cancel_requested,
+        Err(error) => {
+            terminate_worker(&child);
+            return Err(error);
+        }
+    };
+    let mut stdin = {
+        let mut process = child.lock().map_err(|_| "worker process lock poisoned")?;
+        match process.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_child(&mut process);
+                return Err("worker stdin was not piped".into());
+            }
+        }
+    };
+    let write_result = if cancelled_before_delivery {
+        Ok(())
+    } else {
+        stdin
+            .write_all(format!("{request_line}\n").as_bytes())
+            .map_err(|error| format!("failed to write worker request: {error}"))
+    };
+    drop(stdin);
+    if let Err(error) = write_result {
+        if !reservation.cancel_requested()? {
+            terminate_worker(&child);
+            return Err(error);
         }
     }
-    let worker_request = build_worker_request(&request, &account_store)?;
-    state
-        .cancelled
-        .lock()
-        .map_err(|_| "job runtime lock poisoned")?
-        .remove(&request.job_id);
 
-    let (mut child, stdout, stderr) = spawn_worker(&request)?;
-    let request_line = serde_json::to_string(&worker_request).map_err(|error| error.to_string())?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "worker stdin was not piped".to_string())?;
-    stdin
-        .write_all(format!("{request_line}\n").as_bytes())
-        .map_err(|error| format!("failed to write worker request: {error}"))?;
-    drop(stdin);
-
-    let child = Arc::new(Mutex::new(child));
-    state
-        .workers
-        .lock()
-        .map_err(|_| "job runtime lock poisoned")?
-        .insert(request.job_id.clone(), Arc::clone(&child));
-
+    let cancel_requested = match reservation.commit() {
+        Ok(cancel_requested) => cancel_requested,
+        Err(error) => {
+            terminate_worker(&child);
+            return Err(error);
+        }
+    };
     let job_id = request.job_id.clone();
     thread::spawn(move || forward_stderr(stderr, job_id));
+    let bridge_child = Arc::clone(&child);
     tauri::async_runtime::spawn_blocking(move || {
-        bridge_worker_events(app, request.job_id, child, stdout)
+        bridge_worker_events(app, request.job_id, bridge_child, stdout)
     });
+    if cancel_requested {
+        let mut process = child.lock().map_err(|_| "worker process lock poisoned")?;
+        kill_child(&mut process)?;
+    }
     Ok(())
 }
 
@@ -128,31 +478,38 @@ pub fn cancel_transcription_job(
     state: State<'_, JobRuntime>,
     job_id: String,
 ) -> Result<(), String> {
-    state
-        .cancelled
-        .lock()
-        .map_err(|_| "job runtime lock poisoned")?
-        .insert(job_id.clone());
-
-    let worker = state
-        .workers
-        .lock()
-        .map_err(|_| "job runtime lock poisoned")?
-        .get(&job_id)
-        .cloned();
+    let worker = state.request_cancel(&job_id)?;
     if let Some(worker) = worker {
         let mut child = worker.lock().map_err(|_| "worker process lock poisoned")?;
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            child
-                .kill()
-                .map_err(|error| format!("failed to cancel worker: {error}"))?;
-        }
+        kill_child(&mut child)?;
     }
     Ok(())
+}
+
+fn kill_child(child: &mut Child) -> Result<(), String> {
+    if child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        child
+            .kill()
+            .map_err(|error| format!("failed to cancel worker: {error}"))?;
+    }
+    Ok(())
+}
+
+fn terminate_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn terminate_worker(worker: &WorkerHandle) {
+    if let Ok(mut child) = worker.lock() {
+        terminate_child(&mut child);
+    }
 }
 
 fn validate_request(request: &StartJobRequest) -> Result<(), String> {
@@ -362,19 +719,23 @@ fn bridge_worker_events(
         .ok()
         .and_then(|mut process| process.wait().ok());
     let state = app.state::<JobRuntime>();
-    if let Ok(mut workers) = state.workers.lock() {
-        workers.remove(&job_id);
-    }
-    let cancelled = state
-        .cancelled
-        .lock()
-        .map(|mut jobs| jobs.remove(&job_id))
-        .unwrap_or(false);
+    let cancelled = state.finish(&job_id).unwrap_or(false);
 
-    let terminal_event = pending_terminal_event.unwrap_or_else(|| {
-        if cancelled {
-            serde_json::json!({ "type": "cancelled", "jobId": job_id })
-        } else {
+    let terminal_event =
+        terminal_event_after_cleanup(&job_id, pending_terminal_event, cancelled, status);
+    let _ = app.emit(JOB_EVENT_NAME, terminal_event);
+}
+
+fn terminal_event_after_cleanup(
+    job_id: &str,
+    pending_terminal_event: Option<serde_json::Value>,
+    cancelled: bool,
+    status: Option<ExitStatus>,
+) -> serde_json::Value {
+    if cancelled {
+        serde_json::json!({ "type": "cancelled", "jobId": job_id })
+    } else {
+        pending_terminal_event.unwrap_or_else(|| {
             let detail = status
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown exit status".into());
@@ -384,9 +745,8 @@ fn bridge_worker_events(
                 format!("worker exited without a terminal event: {detail}"),
                 true,
             )
-        }
-    });
-    let _ = app.emit(JOB_EVENT_NAME, terminal_event);
+        })
+    }
 }
 
 enum WorkerEventRoute {
@@ -452,13 +812,18 @@ fn forward_stderr(stderr: std::process::ChildStderr, job_id: String) {
 mod tests {
     use super::{
         build_worker_request, python_candidates, route_worker_event, spawn_worker,
-        validate_request, validate_worker_event, StartJobRequest, WorkerEventRoute,
+        terminal_event_after_cleanup, terminate_worker, validate_output_locations_blocking,
+        validate_request, validate_worker_event, JobRuntime, StartJobRequest,
+        ValidateOutputLocationsRequest, WorkerEventRoute, WorkerLifecycle,
     };
     use crate::openai_accounts::{Provider, ProviderAccountStore};
     use std::{
         fs,
         io::{BufRead, BufReader, Write},
         path::Path,
+        process::{Command, Stdio},
+        sync::{mpsc, Arc, Barrier, Mutex},
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -484,6 +849,174 @@ mod tests {
             output_formats: vec!["srt".into()],
             overwrite_policy: "suffix".into(),
         }
+    }
+
+    #[test]
+    fn validates_same_as_input_directories_before_queue_start() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "whispersub-output-validation-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("output fixture directory should be created");
+        let input_path = root.join("lesson.mp4");
+        fs::write(&input_path, b"fixture").expect("input fixture should be written");
+
+        let result = validate_output_locations_blocking(ValidateOutputLocationsRequest {
+            input_paths: vec![input_path.to_string_lossy().into_owned()],
+            output_location_mode: "same_as_input".into(),
+            output_directory: None,
+        });
+
+        assert!(result.valid);
+        assert_eq!(result.code, None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_custom_output_without_a_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "whispersub-output-required-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("output fixture directory should be created");
+        let input_path = root.join("lesson.mp4");
+        fs::write(&input_path, b"fixture").expect("input fixture should be written");
+
+        let result = validate_output_locations_blocking(ValidateOutputLocationsRequest {
+            input_paths: vec![input_path.to_string_lossy().into_owned()],
+            output_location_mode: "custom_directory".into(),
+            output_directory: None,
+        });
+
+        assert!(!result.valid);
+        assert_eq!(result.code.as_deref(), Some("DIRECTORY_REQUIRED"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn concurrent_starts_reserve_only_one_worker_slot() {
+        let runtime = Arc::new(JobRuntime::default());
+        let start = Arc::new(Barrier::new(3));
+        let finish = Arc::new(Barrier::new(3));
+        let attempts = (1..=2)
+            .map(|number| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                let finish = Arc::clone(&finish);
+                thread::spawn(move || {
+                    start.wait();
+                    let reservation = runtime.reserve_start(&format!("job_{number:02}")).ok();
+                    finish.wait();
+                    reservation.is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        finish.wait();
+        let successful_starts = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().expect("start attempt should not panic"))
+            .filter(|succeeded| *succeeded)
+            .count();
+
+        assert_eq!(successful_starts, 1);
+    }
+
+    #[test]
+    fn preserves_cancel_requested_while_worker_is_starting() {
+        let mut lifecycle = WorkerLifecycle::<&str>::default();
+        lifecycle
+            .reserve_start("job_01")
+            .expect("job should reserve the worker slot");
+
+        assert!(lifecycle
+            .register_starting_worker("job_01", "worker-handle")
+            .is_ok());
+        assert_eq!(lifecycle.request_cancel("job_01"), Some(&"worker-handle"));
+        let cancel_requested = lifecycle
+            .commit_start("job_01")
+            .expect("reserved job should transition to running");
+
+        assert!(cancel_requested);
+    }
+
+    #[test]
+    fn cancel_can_kill_registered_worker_before_request_delivery() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep fixture should spawn");
+        let mut stdin = child.stdin.take().expect("fixture stdin should be piped");
+        let worker = Arc::new(Mutex::new(child));
+        let mut lifecycle = WorkerLifecycle::default();
+        lifecycle
+            .reserve_start("job_01")
+            .expect("job should reserve the worker slot");
+        lifecycle
+            .register_starting_worker("job_01", Arc::clone(&worker))
+            .expect("spawned child should be cancellable before request delivery");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).expect("writer should signal start");
+            stdin.write_all(&vec![b'x'; 1024 * 1024])
+        });
+        started_rx.recv().expect("writer should start");
+
+        let cancel_target = lifecycle
+            .request_cancel("job_01")
+            .cloned()
+            .expect("starting worker should expose its kill handle");
+        super::kill_child(
+            &mut cancel_target
+                .lock()
+                .expect("worker process lock should be available"),
+        )
+        .expect("cancel should kill the starting worker");
+        let write_result = writer.join().expect("writer should not panic");
+        terminate_worker(&worker);
+
+        assert!(write_result.is_err());
+    }
+
+    #[test]
+    fn rolls_back_worker_slot_when_start_reservation_is_dropped() {
+        let runtime = JobRuntime::default();
+        {
+            let _reservation = runtime
+                .reserve_start("job_01")
+                .expect("first job should reserve the worker slot");
+        }
+
+        runtime
+            .reserve_start("job_02")
+            .expect("failed start must release the worker slot");
+    }
+
+    #[test]
+    fn accepted_cancel_wins_over_pending_completed_event() {
+        let completed = serde_json::json!({
+            "type": "completed",
+            "jobId": "job_01",
+            "outputs": ["/tmp/lesson.srt"]
+        });
+
+        let terminal = terminal_event_after_cleanup("job_01", Some(completed), true, None);
+
+        assert_eq!(terminal["type"], "cancelled");
+        assert_eq!(terminal["jobId"], "job_01");
     }
 
     #[test]

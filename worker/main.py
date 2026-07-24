@@ -39,7 +39,18 @@ def main() -> int:
             return 0
         request = parse_start_job(message)
         translator = build_translation_adapter(request.translation_provider)
-        run_job(request, WhisperEngine(), emit, translator=translator)
+        readiness_check = (
+            translator.preflight
+            if isinstance(translator, OpenAITranslationAdapter)
+            else None
+        )
+        run_job(
+            request,
+            WhisperEngine(),
+            emit,
+            translator=translator,
+            readiness_check=readiness_check,
+        )
         return 0
     except json.JSONDecodeError as error:
         emit(WorkerError("INVALID_JSON", str(error)).as_event())

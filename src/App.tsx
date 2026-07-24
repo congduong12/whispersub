@@ -6,9 +6,13 @@ import {
   KeyIcon,
   MenuIcon,
   SidebarToggleIcon,
+  TrashIcon,
 } from "./components/AppIcons";
 import { DropZone } from "./components/DropZone";
 import { JobList } from "./components/JobList";
+import { OutputSettings } from "./features/job/OutputSettings";
+import { getOutputDirectoryName } from "./features/job/outputLocation";
+import { getQueueTerminalSummary } from "./features/job/queueSummary";
 import { targetLanguageChoices } from "./features/job/targetLanguage";
 import { useJobQueue } from "./features/job/useJobQueue";
 import { parseHashRoute } from "./features/navigation/hashRoute";
@@ -31,6 +35,7 @@ const languageLabels: Record<string, string> = {
   auto: "Tự nhận diện",
   vi: "Tiếng Việt",
   en: "English",
+  none: "Giữ nguyên",
 };
 
 const deviceLabels: Record<string, string> = {
@@ -62,7 +67,15 @@ function App() {
     setOptions,
     queueRunning,
     targetLanguageReadiness,
+    outputLocationReadiness,
+    outputLocationError,
+    outputLocationBusy,
+    choosingOutputDirectory,
+    validatingOutputLocation,
     chooseFiles,
+    chooseOutputDirectory,
+    useSameOutputLocation,
+    useCustomOutputLocation,
     startQueue,
     cancelCurrent,
     removeJob,
@@ -121,12 +134,44 @@ function App() {
     };
   }, [navigationOpen]);
 
-  const finishedCount = jobs.filter((job) => job.status === "completed").length;
+  const terminalSummary = getQueueTerminalSummary(jobs);
+  const settingsLocked = queueRunning || outputLocationBusy;
   const canStart =
-    jobs.some((job) => job.status === "queued") &&
-    !queueRunning &&
-    targetLanguageReadiness.ready;
+    terminalSummary.queuedCount > 0 &&
+    !settingsLocked &&
+    targetLanguageReadiness.ready &&
+    outputLocationReadiness.ready;
   const latestSegment = activeJob?.segments[activeJob.segments.length - 1];
+  const readyStatusText = !targetLanguageReadiness.ready
+    ? targetLanguageReadiness.reason
+    : outputLocationError ??
+      (!outputLocationReadiness.ready
+        ? outputLocationReadiness.reason
+        : validatingOutputLocation
+          ? "Đang kiểm tra nơi lưu phụ đề…"
+          : "Sẵn sàng tạo phụ đề");
+  const queueStatusText = activeJob
+    ? `Đang xử lý: ${activeJob.fileName}`
+    : jobs.length
+      ? readyStatusText
+      : "Chọn video để bắt đầu";
+  const queueHelperText =
+    terminalSummary.helperText ??
+    (terminalSummary.terminalCount > 0
+      ? `${queueStatusText} · Xóa lịch sử không xóa file SRT/VTT.`
+      : queueStatusText);
+  const createButtonLabel =
+    validatingOutputLocation
+      ? "Đang kiểm tra nơi lưu…"
+      : terminalSummary.terminalCount > 0 && terminalSummary.queuedCount > 0
+        ? `Tạo phụ đề (${terminalSummary.queuedCount})`
+        : "Tạo phụ đề";
+  const outputLocationSummary =
+    options.outputLocationMode === "same_as_input"
+      ? "cạnh file gốc"
+      : options.outputDirectory
+        ? getOutputDirectoryName(options.outputDirectory)
+        : "chưa chọn";
   const appShellClassName = [
     "app-shell",
     sidebarCollapsed ? "sidebar-collapsed" : "",
@@ -247,15 +292,27 @@ function App() {
                   <h2>Hàng đợi</h2>
                   <p>Thêm nhiều file và xử lý tuần tự để giữ máy luôn ổn định.</p>
                 </div>
-                {finishedCount > 0 && (
-                  <button type="button" className="text-button" onClick={clearFinished}>
-                    Dọn file đã xong
+                {terminalSummary.terminalCount > 0 && (
+                  <button
+                    type="button"
+                      className="clear-history-button"
+                      onClick={clearFinished}
+                      disabled={validatingOutputLocation}
+                    aria-label={`Xóa ${terminalSummary.terminalCount} mục khỏi lịch sử hàng đợi`}
+                  >
+                    <TrashIcon />
+                    <span>Xóa lịch sử</span>
                   </button>
                 )}
               </div>
 
-              <DropZone onChoose={() => void chooseFiles()} disabled={queueRunning} />
-              <JobList jobs={jobs} onRemove={removeJob} />
+                <DropZone onChoose={() => void chooseFiles()} disabled={settingsLocked} />
+                <JobList
+                  jobs={jobs}
+                  autoRevealNewJobs={!queueRunning}
+                  removalDisabled={validatingOutputLocation}
+                  onRemove={removeJob}
+              />
 
               {latestSegment && (
                 <div className="live-segment" aria-live="polite">
@@ -266,16 +323,10 @@ function App() {
 
               <div className="action-row">
                 <div aria-live="polite">
-                  <span className="queue-count">{jobs.length} file đã chọn</span>
-                  <small>
-                    {activeJob
-                      ? `Đang xử lý: ${activeJob.fileName}`
-                      : jobs.length
-                          ? targetLanguageReadiness.ready
-                            ? "Sẵn sàng tạo phụ đề"
-                            : targetLanguageReadiness.reason
-                          : "Chọn video để bắt đầu"}
-                  </small>
+                  <span className="queue-count">
+                    {terminalSummary.countLabel ?? `${jobs.length} file đã chọn`}
+                  </span>
+                  <small>{queueHelperText}</small>
                 </div>
                 {activeJob ? (
                   <button
@@ -285,14 +336,25 @@ function App() {
                   >
                     Hủy file hiện tại
                   </button>
+                ) : terminalSummary.allTerminal ? (
+                  <button
+                    className="primary-button"
+                    type="button"
+                      onClick={() => void chooseFiles()}
+                      disabled={settingsLocked}
+                  >
+                    Chọn thêm file
+                    <span aria-hidden="true">→</span>
+                  </button>
                 ) : (
                   <button
                     className="primary-button"
                     type="button"
-                    onClick={startQueue}
-                    disabled={!canStart}
+                      onClick={() => void startQueue()}
+                      disabled={!canStart}
+                      aria-busy={validatingOutputLocation}
                   >
-                    Tạo phụ đề
+                    {createButtonLabel}
                     <span aria-hidden="true">→</span>
                   </button>
                 )}
@@ -304,8 +366,9 @@ function App() {
                   <span>
                     <strong>Tùy chỉnh xử lý</strong>
                     <small>
-                      {modelLabels[options.model]} · Audio: {languageLabels[options.sourceLanguage]} ·{" "}
-                      {deviceLabels[options.device]} · Phụ đề: {languageLabels[options.targetLanguage]}
+                        {modelLabels[options.model]} · Audio: {languageLabels[options.sourceLanguage]} ·{" "}
+                        {deviceLabels[options.device]} · Phụ đề: {languageLabels[options.targetLanguage]} ·{" "}
+                        Lưu: {outputLocationSummary}
                     </small>
                   </span>
                   <span className="disclosure-action" aria-hidden="true">
@@ -333,7 +396,7 @@ function App() {
                             model: event.target.value as typeof options.model,
                           })
                         }
-                        disabled={queueRunning}
+                          disabled={settingsLocked}
                       >
                         <option value="tiny">Tiny · nhanh nhất</option>
                         <option value="base">Base · nhẹ</option>
@@ -355,7 +418,7 @@ function App() {
                             sourceLanguage: event.target.value as typeof options.sourceLanguage,
                           })
                         }
-                        disabled={queueRunning}
+                          disabled={settingsLocked}
                       >
                         <option value="auto">Tự nhận diện · Việt + Anh</option>
                         <option value="vi">Chủ yếu tiếng Việt</option>
@@ -379,7 +442,7 @@ function App() {
                             translationConsent: false,
                           });
                         }}
-                        disabled={queueRunning}
+                          disabled={settingsLocked}
                       >
                         {targetLanguageChoices.map((choice) => (
                           <option
@@ -411,7 +474,7 @@ function App() {
                             device: event.target.value as typeof options.device,
                           })
                         }
-                        disabled={queueRunning}
+                          disabled={settingsLocked}
                       >
                         <option value="auto">Tự động · đề xuất</option>
                         <option value="mps">Apple GPU (MPS)</option>
@@ -424,37 +487,27 @@ function App() {
                     <TranslationConfig
                       options={options}
                       setOptions={setOptions}
-                      queueRunning={queueRunning}
-                    />
-                  )}
+                        queueRunning={settingsLocked}
+                      />
+                    )}
 
-                  <div className="output-card">
-                  <div>
-                    <strong>Định dạng phụ đề</strong>
-                    <small>Lưu cạnh file gốc</small>
-                  </div>
-                  <label className="format-check locked" htmlFor="format-srt">
-                    <input id="format-srt" type="checkbox" checked readOnly /> SRT
-                  </label>
-                  <label className="format-check" htmlFor="format-vtt">
-                    <input
-                      id="format-vtt"
-                      type="checkbox"
-                      checked={options.includeVtt}
-                      onChange={(event) =>
-                        setOptions({ ...options, includeVtt: event.target.checked })
-                      }
-                      disabled={queueRunning}
+                    <OutputSettings
+                      options={options}
+                      setOptions={setOptions}
+                      queuedCount={terminalSummary.queuedCount}
+                      disabled={settingsLocked}
+                      choosingDirectory={choosingOutputDirectory}
+                      error={outputLocationError}
+                      onChooseDirectory={() => void chooseOutputDirectory()}
+                      onUseSameDirectory={useSameOutputLocation}
+                      onUseCustomDirectory={useCustomOutputLocation}
                     />
-                    VTT
-                  </label>
-                </div>
               </div>
             </details>
           </section>
         </>
       ) : (
-        <ApiKeysPage provider={route.provider} disabled={queueRunning} />
+          <ApiKeysPage provider={route.provider} disabled={settingsLocked} />
       )}
 
           <footer>

@@ -18,8 +18,18 @@ const activeStatuses = new Set<JobStatus>([
   "cancelling",
 ]);
 
+const terminalStatuses = new Set<JobStatus>([
+  "completed",
+  "cancelled",
+  "failed",
+]);
+
 export function isJobActive(job: QueuedJob): boolean {
   return activeStatuses.has(job.status);
+}
+
+export function isJobTerminal(job: QueuedJob): boolean {
+  return terminalStatuses.has(job.status);
 }
 
 export function fileNameFromPath(path: string): string {
@@ -35,8 +45,9 @@ function createJob(path: string): QueuedJob {
     status: "queued",
     progress: 0,
     segments: [],
-    outputs: [],
-    error: null,
+      outputs: [],
+      error: null,
+      errorCode: null,
   };
 }
 
@@ -65,8 +76,13 @@ function applyEvent(job: QueuedJob, event: JobEvent): QueuedJob {
       };
     case "cancelled":
       return { ...job, status: "cancelled" };
-    case "error":
-      return { ...job, status: "failed", error: event.message };
+      case "error":
+        return {
+          ...job,
+          status: "failed",
+          error: event.message,
+          errorCode: event.code,
+        };
   }
 }
 
@@ -96,9 +112,7 @@ export function jobReducer(state: QueuedJob[], action: JobAction): QueuedJob[] {
     case "event_received":
       return state.map((job) => applyEvent(job, action.event));
     case "clear_finished":
-      return state.filter(
-        (job) => !["completed", "cancelled", "failed"].includes(job.status),
-      );
+      return state.filter((job) => !isJobTerminal(job));
     case "reset":
       return [];
   }
