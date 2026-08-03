@@ -6,16 +6,27 @@ import tempfile
 from pathlib import Path
 
 from worker.whispersub_worker.engine import Segment
-from worker.whispersub_worker.protocol import StartJobRequest, WorkerError
+from worker.whispersub_worker.protocol import LocalFileSource, StartJobRequest, WorkerError
 
 
-def write_outputs(request: StartJobRequest, segments: list[Segment]) -> list[Path]:
+def write_outputs(
+    request: StartJobRequest,
+    segments: list[Segment],
+    *,
+    output_stem: str | None = None,
+    existing_outputs: dict[str, Path] | None = None,
+) -> list[Path]:
     validated = _validate_segments(segments, request.job_id)
-    output_dir = (
-        request.input_path.parent
-        if request.output_location_mode == "same_as_input"
-        else request.output_directory
-    )
+    if request.output_location_mode == "same_as_input":
+        if not isinstance(request.source, LocalFileSource):
+            raise WorkerError(
+                "OUTPUT_WRITE_FAILED",
+                "YouTube subtitle output requires a custom directory",
+                job_id=request.job_id,
+            )
+        output_dir = request.source.input_path.parent
+    else:
+        output_dir = request.output_directory
     if output_dir is None or not output_dir.exists() or not output_dir.is_dir():
         raise WorkerError(
             "OUTPUT_WRITE_FAILED",
@@ -29,14 +40,18 @@ def write_outputs(request: StartJobRequest, segments: list[Segment]) -> list[Pat
             job_id=request.job_id,
         )
 
+    resolved_stem = output_stem or _default_output_stem(request)
+    _validate_output_stem(resolved_stem, request.job_id)
+    reusable = existing_outputs or {}
+    missing_formats = tuple(
+        output_format
+        for output_format in request.output_formats
+        if output_format not in reusable
+    )
     destinations = _resolve_destinations(
         output_dir,
-        (
-            request.input_path.stem
-            if request.target_language == "none"
-            else f"{request.input_path.stem}.{request.target_language}"
-        ),
-        request.output_formats,
+        resolved_stem,
+        missing_formats,
         request.overwrite_policy,
         request.job_id,
     )
@@ -63,7 +78,14 @@ def write_outputs(request: StartJobRequest, segments: list[Segment]) -> list[Pat
                 staged.append((Path(handle.name), destination))
         for temporary, destination in staged:
             os.replace(temporary, destination)
-        return [destination for _, destination in staged]
+        published = {
+            **reusable,
+            **{
+                output_format: destination
+                for output_format, destination in destinations
+            },
+        }
+        return [published[output_format] for output_format in request.output_formats]
     except OSError as error:
         raise WorkerError(
             "OUTPUT_WRITE_FAILED",
@@ -73,6 +95,32 @@ def write_outputs(request: StartJobRequest, segments: list[Segment]) -> list[Pat
     finally:
         for temporary, _ in staged:
             temporary.unlink(missing_ok=True)
+
+
+def _default_output_stem(request: StartJobRequest) -> str:
+    if not isinstance(request.source, LocalFileSource):
+        raise WorkerError(
+            "OUTPUT_WRITE_FAILED",
+            "YouTube output name was not resolved",
+            job_id=request.job_id,
+        )
+    return (
+        request.source.input_path.stem
+        if request.target_language == "none"
+        else f"{request.source.input_path.stem}.{request.target_language}"
+    )
+
+
+def _validate_output_stem(stem: str, job_id: str) -> None:
+    if (
+        not stem
+        or len(stem) > 128
+        or stem in {".", ".."}
+        or Path(stem).name != stem
+        or "/" in stem
+        or "\\" in stem
+    ):
+        raise WorkerError("OUTPUT_WRITE_FAILED", "Resolved output name is invalid", job_id=job_id)
 
 
 def render_srt(segments: list[Segment]) -> str:

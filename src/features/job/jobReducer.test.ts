@@ -41,6 +41,17 @@ describe("jobReducer", () => {
     expect(jobs[2].status).toBe("queued");
   });
 
+  it("adds a YouTube source once and preserves the queue source", () => {
+    const url = "https://youtu.be/abc123";
+    const jobs = jobReducer(
+      jobReducer([], { type: "add_youtube", url }),
+      { type: "add_youtube", url },
+    );
+
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].source).toEqual({ kind: "youtube", url });
+  });
+
   it("moves a job through progress and completion events", () => {
     const [queued] = jobReducer([], {
       type: "add_paths",
@@ -73,6 +84,31 @@ describe("jobReducer", () => {
       progress: 100,
       outputs: ["/video/lesson.srt"],
     });
+  });
+
+  it("retains redacted source provenance without retaining downloader metadata", () => {
+    const [queued] = jobReducer([], {
+      type: "add_paths",
+      paths: ["/video/lesson.mp4"],
+    });
+    const resolved = jobReducer([queued], {
+      type: "event_received",
+      event: {
+        type: "source_resolved",
+        jobId: queued.jobId,
+        displayTitle: "Safe title",
+        transcriptOrigin: "manual_caption",
+        sourceLanguage: "en",
+        cacheHit: false,
+      },
+    });
+
+      expect(resolved[0].provenance).toEqual({
+        displayTitle: "Safe title",
+        origin: "manual_caption",
+        sourceLanguage: "en",
+        cacheHit: false,
+      });
   });
 
   it("clears only terminal history and preserves queued or active jobs", () => {

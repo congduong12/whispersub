@@ -33,6 +33,14 @@ class WorkerProcessTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["worker"], "local")
         self.assertEqual(result.stderr, "")
 
+    def test_diagnostics_round_trip_is_jsonl_and_does_not_need_a_job(self) -> None:
+        result = self.run_worker('{"type":"diagnostics"}\n')
+
+        self.assertEqual(result.returncode, 0)
+        event = json.loads(result.stdout)
+        self.assertEqual(event["type"], "diagnostics")
+        self.assertEqual(event["runtime"][0]["component"], "yt-dlp")
+
     def test_invalid_json_returns_typed_error_and_nonzero_exit(self) -> None:
         result = self.run_worker("not-json\n")
 
@@ -41,7 +49,10 @@ class WorkerProcessTest(unittest.TestCase):
 
     def test_start_job_streams_started_then_input_error(self) -> None:
         message = valid_message()
-        message["inputPath"] = "/definitely/missing/Bài học.mp4"
+        message["source"] = {
+            "kind": "local_file",
+            "inputPath": "/definitely/missing/Bài học.mp4",
+        }
         result = self.run_worker(json.dumps(message, ensure_ascii=False) + "\n")
 
         events = [json.loads(line) for line in result.stdout.splitlines()]

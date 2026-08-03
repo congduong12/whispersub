@@ -5,7 +5,7 @@ import { getQueueTerminalSummary } from "./queueSummary";
 function makeJob(status: JobStatus, index = 1): QueuedJob {
   return {
     jobId: `job-${index}`,
-    inputPath: `/video/lesson-${index}.mp4`,
+    source: { kind: "local_file", inputPath: `/video/lesson-${index}.mp4` },
     fileName: `lesson-${index}.mp4`,
     status,
     progress: status === "completed" ? 100 : 0,

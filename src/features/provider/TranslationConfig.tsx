@@ -39,6 +39,7 @@ interface TranslationConfigProps {
   options: JobOptions;
   setOptions: Dispatch<SetStateAction<JobOptions>>;
   queueRunning: boolean;
+  providerLocked?: boolean;
 }
 
 function isOfficialEndpoint(provider: Provider, baseUrl: string): boolean {
@@ -56,6 +57,7 @@ export function TranslationConfig({
   options,
   setOptions,
   queueRunning,
+  providerLocked = false,
 }: TranslationConfigProps) {
   const [accounts, setAccounts] = useState<ProviderAccountSummary[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(true);
@@ -197,11 +199,16 @@ export function TranslationConfig({
                 translationConsent: false,
               });
             }}
-            disabled={queueRunning}
+            disabled={queueRunning || providerLocked}
             >
               <option value="openai">OpenAI</option>
               <option value="gemini">Gemini</option>
             </select>
+            {providerLocked && (
+              <small className="field-help">
+                Batch có YouTube cần nhận diện hoặc dịch nên dùng một cấu hình Gemini chung.
+              </small>
+            )}
         </label>
 
         <label htmlFor="translation-account">
@@ -296,7 +303,7 @@ export function TranslationConfig({
                       {ungroupedModelLabel(model)}
                     </option>
                   ))}
-            </select>
+              </select>
           )}
           <div className="translation-model-actions">
             <button

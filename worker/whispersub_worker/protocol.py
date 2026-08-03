@@ -42,9 +42,25 @@ ProtocolError = WorkerError
 
 
 @dataclass(frozen=True)
+class LocalFileSource:
+    input_path: Path
+
+
+@dataclass(frozen=True)
+class YoutubeSource:
+    url: str
+
+
+JobSource = LocalFileSource | YoutubeSource
+
+
+@dataclass(frozen=True)
 class StartJobRequest:
     job_id: str
-    input_path: Path
+    source: JobSource
+    workspace_path: Path
+    youtube_cache_path: Path | None
+    youtube_library_path: Path | None
     output_location_mode: Literal["same_as_input", "custom_directory"]
     output_directory: Path | None
     model: str
@@ -62,6 +78,22 @@ class StartJobRequest:
     output_formats: tuple[str, ...]
     overwrite_policy: str
 
+    @property
+    def input_path(self) -> Path:
+        """Compatibility accessor for local-only processing stages.
+
+        YouTube resolver stages must turn their source into a local workspace
+        artifact before they use this property.
+        """
+
+        if isinstance(self.source, LocalFileSource):
+            return self.source.input_path
+        raise WorkerError(
+            "YOUTUBE_SOURCE_NOT_RESOLVED",
+            "YouTube source has not been resolved to local media",
+            job_id=self.job_id,
+        )
+
 
 def parse_start_job(message: dict[str, Any]) -> StartJobRequest:
     job_id = _required_string(message, "jobId")
@@ -72,7 +104,26 @@ def parse_start_job(message: dict[str, Any]) -> StartJobRequest:
             job_id=job_id,
         )
 
-    input_path = Path(_required_string(message, "inputPath", job_id=job_id)).expanduser()
+    source = _parse_source(message, job_id)
+    workspace_path = Path(_required_string(message, "workspacePath", job_id=job_id)).expanduser()
+    if not workspace_path.is_absolute():
+        raise WorkerError(
+            "INVALID_REQUEST", "workspacePath must be absolute", job_id=job_id
+          )
+    raw_youtube_cache_path = message.get("youtubeCachePath")
+    youtube_cache_path = (
+        Path(raw_youtube_cache_path).expanduser()
+        if isinstance(raw_youtube_cache_path, str) and raw_youtube_cache_path.strip()
+        else None
+    )
+    if youtube_cache_path is not None and not youtube_cache_path.is_absolute():
+        raise WorkerError(
+            "INVALID_REQUEST", "youtubeCachePath must be absolute", job_id=job_id
+        )
+    raw_youtube_library_path = message.get("youtubeLibraryPath")
+    youtube_library_path = Path(raw_youtube_library_path).expanduser() if isinstance(raw_youtube_library_path, str) and raw_youtube_library_path.strip() else None
+    if youtube_library_path is not None and not youtube_library_path.is_absolute():
+        raise WorkerError("INVALID_REQUEST", "youtubeLibraryPath must be absolute", job_id=job_id)
     output_location_mode = message.get("outputLocationMode", "same_as_input")
     if output_location_mode not in {"same_as_input", "custom_directory"}:
         raise WorkerError(
@@ -93,6 +144,28 @@ def parse_start_job(message: dict[str, Any]) -> StartJobRequest:
             "outputDirectory is required for custom_directory mode",
             job_id=job_id,
         )
+    if isinstance(source, YoutubeSource) and output_location_mode != "custom_directory":
+        raise WorkerError(
+            "INVALID_REQUEST",
+            "YouTube jobs require a custom output directory",
+            job_id=job_id,
+          )
+    if isinstance(source, YoutubeSource) and youtube_cache_path is None:
+        raise WorkerError(
+            "INVALID_REQUEST",
+            "YouTube jobs require an Application Support cache path",
+            job_id=job_id,
+        )
+    if isinstance(source, YoutubeSource) and youtube_library_path is None:
+        raise WorkerError("INVALID_REQUEST", "YouTube jobs require an Application Support library path", job_id=job_id)
+    if isinstance(source, LocalFileSource) and youtube_cache_path is not None:
+        raise WorkerError(
+            "INVALID_REQUEST",
+            "Local file jobs must not contain youtubeCachePath",
+            job_id=job_id,
+        )
+    if isinstance(source, LocalFileSource) and youtube_library_path is not None:
+        raise WorkerError("INVALID_REQUEST", "Local file jobs must not contain youtubeLibraryPath", job_id=job_id)
 
     model = _enum(message, "model", SUPPORTED_MODELS, "small", job_id)
     source_language = _enum(
@@ -139,10 +212,12 @@ def parse_start_job(message: dict[str, Any]) -> StartJobRequest:
     provider_model = _optional_string(message, "providerModel", job_id)
     provider_api_key = _optional_string(message, "providerApiKey", job_id)
     provider_base_url = _optional_string(message, "providerBaseUrl", job_id)
+    is_youtube = isinstance(source, YoutubeSource)
 
     if translation_provider == "none":
+        expected_target = "vi" if is_youtube else "none"
         if (
-            target_language != "none"
+            target_language != expected_target
             or translation_mode != "none"
             or technical_translation
             or translation_consent
@@ -156,9 +231,9 @@ def parse_start_job(message: dict[str, Any]) -> StartJobRequest:
                 job_id=job_id,
             )
     else:
-        if target_language not in {"en", "vi"}:
+        if target_language not in ({"vi"} if is_youtube else {"en", "vi"}):
             raise WorkerError(
-                "INVALID_REQUEST", "Translation target must be en or vi", job_id=job_id
+                "INVALID_REQUEST", "Translation target is not valid for this source", job_id=job_id
             )
         if translation_mode != "technical_context" or not technical_translation:
             raise WorkerError(
@@ -183,9 +258,26 @@ def parse_start_job(message: dict[str, Any]) -> StartJobRequest:
                 "INVALID_REQUEST", "providerBaseUrl is invalid", job_id=job_id
             )
 
+    if is_youtube:
+        if source_language == "vi" and translation_provider != "none":
+            raise WorkerError(
+                "INVALID_REQUEST",
+                "Vietnamese YouTube sources must not use a translation provider",
+                job_id=job_id,
+            )
+        if source_language != "vi" and translation_provider != "gemini_api":
+            raise WorkerError(
+                "INVALID_REQUEST",
+                "Non-Vietnamese YouTube sources require consented Gemini translation",
+                job_id=job_id,
+            )
+
     return StartJobRequest(
         job_id=job_id,
-        input_path=input_path,
+        source=source,
+        workspace_path=workspace_path,
+        youtube_cache_path=youtube_cache_path,
+        youtube_library_path=youtube_library_path,
         output_location_mode=output_location_mode,
         output_directory=output_directory,
         model=model,
@@ -209,7 +301,7 @@ def handle_message(message: dict[str, Any]) -> list[dict[str, Any]]:
     """Handle control messages that do not execute a transcription job."""
 
     if message.get("type") == "ping":
-        return [{"type": "pong", "protocolVersion": 1, "worker": "local"}]
+        return [{"type": "pong", "protocolVersion": 2, "worker": "local"}]
     parse_start_job(message)
     return []
 
@@ -221,6 +313,26 @@ def _required_string(message: dict[str, Any], key: str, *, job_id: str = "unknow
             "INVALID_REQUEST", f"{key} must be a non-empty string", job_id=job_id
         )
     return value
+
+
+def _parse_source(message: dict[str, Any], job_id: str) -> JobSource:
+    raw_source = message.get("source")
+    if not isinstance(raw_source, dict):
+        raise WorkerError("INVALID_REQUEST", "source must be an object", job_id=job_id)
+    kind = raw_source.get("kind")
+    if kind == "local_file":
+        input_path = raw_source.get("inputPath")
+        if not isinstance(input_path, str) or not input_path.strip():
+            raise WorkerError(
+                "INVALID_REQUEST", "local source inputPath must be a non-empty string", job_id=job_id
+            )
+        return LocalFileSource(input_path=Path(input_path).expanduser())
+    if kind == "youtube":
+        url = raw_source.get("url")
+        if not isinstance(url, str) or not url.strip() or len(url) > 2048:
+            raise WorkerError("INVALID_REQUEST", "YouTube source URL is invalid", job_id=job_id)
+        return YoutubeSource(url=url)
+    raise WorkerError("INVALID_REQUEST", "source kind is unsupported", job_id=job_id)
 
 
 def _optional_string(message: dict[str, Any], key: str, job_id: str) -> str | None:

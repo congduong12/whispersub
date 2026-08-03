@@ -19,4 +19,10 @@ describe("job failure presentation", () => {
       "Gỡ file rồi thêm lại để thử lại.",
     );
   });
+
+  it("explains YouTube guard and local runtime recovery", () => {
+    expect(getJobFailureRecovery("YOUTUBE_DURATION_EXCEEDED")).toContain("4 giờ");
+    expect(getJobFailureRecovery("YOUTUBE_DISK_INSUFFICIENT")).toContain("dung lượng");
+    expect(getJobFailureRecovery("YTDLP_JS_RUNTIME_NOT_READY")).toContain("Deno");
+  });
 });

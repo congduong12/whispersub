@@ -1,9 +1,13 @@
-use crate::openai_accounts::{Provider, ProviderAccountStore};
+use crate::{
+    local_storage::LocalStorage,
+    openai_accounts::{Provider, ProviderAccountStore},
+};
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     env,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -12,8 +16,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use url::Url;
 
 const JOB_EVENT_NAME: &str = "whispersub://job-event";
+const WORKSPACE_ROOT_NAME: &str = "whispersub-job-workspaces";
+const WORKSPACE_MARKER_NAME: &str = ".whispersub-workspace-owner";
+const WORKSPACE_LEASE_NAME: &str = ".whispersub-workspace-lease";
 
 type WorkerHandle = Arc<Mutex<Child>>;
 
@@ -170,6 +178,173 @@ impl JobRuntime {
     }
 }
 
+struct JobWorkspace {
+    path: PathBuf,
+    lease: Option<File>,
+    cleaned: bool,
+}
+
+impl JobWorkspace {
+    fn create(job_id: &str) -> Result<Self, String> {
+        let root = workspace_root();
+        ensure_workspace_root(&root)?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let label = workspace_label(job_id);
+        for attempt in 0..8 {
+            let path = root.join(format!(
+                "job-{label}-{}-{nonce}-{attempt}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    let lease = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(path.join(WORKSPACE_LEASE_NAME))
+                        .and_then(|lease| {
+                            if lease.try_lock_exclusive()? {
+                                Ok(lease)
+                            } else {
+                                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                            }
+                        })
+                        .map_err(|error| {
+                            let _ = fs::remove_dir_all(&path);
+                            format!("failed to acquire job workspace lease: {error}")
+                        })?;
+                    fs::write(path.join(WORKSPACE_MARKER_NAME), "whispersub-owned-v1\n").map_err(
+                        |error| {
+                            let _ = fs::remove_dir_all(&path);
+                            format!("failed to mark job workspace: {error}")
+                        },
+                    )?;
+                    return Ok(Self {
+                        path,
+                        lease: Some(lease),
+                        cleaned: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("failed to create job workspace: {error}")),
+            }
+        }
+        Err("failed to allocate a unique job workspace".into())
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if !is_owned_workspace(&self.path) {
+            return Err("refusing to clean an unowned job workspace".into());
+        }
+        self.lease.take();
+        fs::remove_dir_all(&self.path)
+            .map_err(|error| format!("failed to clean job workspace: {error}"))?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for JobWorkspace {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+pub fn scavenge_orphaned_workspaces() -> Result<(), String> {
+    let root = workspace_root();
+    if !root.exists() {
+        return Ok(());
+    }
+    ensure_workspace_root(&root)?;
+    for entry in
+        fs::read_dir(&root).map_err(|error| format!("failed to inspect workspace root: {error}"))?
+    {
+        let path = entry
+            .map_err(|error| format!("failed to inspect workspace entry: {error}"))?
+            .path();
+        if is_owned_workspace(&path) && !workspace_has_live_lease(&path) {
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("failed to scavenge orphan workspace: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn workspace_has_live_lease(path: &Path) -> bool {
+    let lease_path = path.join(WORKSPACE_LEASE_NAME);
+    match fs::symlink_metadata(&lease_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => true,
+        Err(_) => true,
+        Ok(_) => match OpenOptions::new().read(true).write(true).open(&lease_path) {
+            Ok(lease) => match lease.try_lock_exclusive() {
+                Ok(acquired) => !acquired,
+                Err(_) => true,
+            },
+            Err(_) => true,
+        },
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    env::temp_dir().join(WORKSPACE_ROOT_NAME)
+}
+
+fn ensure_workspace_root(root: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("job workspace root must not be a symlink".into())
+        }
+        Ok(metadata) if !metadata.is_dir() => Err("job workspace root is not a directory".into()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(root)
+            .map_err(|create_error| format!("failed to create workspace root: {create_error}")),
+        Err(error) => Err(format!("failed to inspect workspace root: {error}")),
+    }
+}
+
+fn is_owned_workspace(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent != workspace_root() {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    matches!(fs::read_to_string(path.join(WORKSPACE_MARKER_NAME)), Ok(marker) if marker == "whispersub-owned-v1\n")
+}
+
+fn workspace_label(job_id: &str) -> String {
+    let value: String = job_id
+        .chars()
+        .filter_map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => Some(character),
+            _ => None,
+        })
+        .take(48)
+        .collect();
+    if value.is_empty() {
+        "job".into()
+    } else {
+        value
+    }
+}
+
 struct StartReservation<'a> {
     runtime: &'a JobRuntime,
     job_id: String,
@@ -269,7 +444,7 @@ pub async fn validate_output_locations(
 fn validate_output_locations_blocking(
     request: ValidateOutputLocationsRequest,
 ) -> OutputLocationValidationResult {
-    if request.input_paths.is_empty() {
+    if request.input_paths.is_empty() && request.output_location_mode == "same_as_input" {
         return OutputLocationValidationResult::invalid("NO_INPUTS", None);
     }
 
@@ -359,7 +534,7 @@ pub struct StartJobRequest {
     #[serde(rename = "type")]
     request_type: String,
     job_id: String,
-    input_path: String,
+    source: StartJobSource,
     output_location_mode: String,
     output_directory: Option<String>,
     model: String,
@@ -379,6 +554,18 @@ pub struct StartJobRequest {
     overwrite_policy: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StartJobSource {
+    LocalFile {
+        #[serde(rename = "inputPath")]
+        input_path: String,
+    },
+    Youtube {
+        url: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkerStartJobRequest {
@@ -388,6 +575,11 @@ struct WorkerStartJobRequest {
     provider_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_base_url: Option<String>,
+    workspace_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    youtube_cache_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    youtube_library_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -403,7 +595,7 @@ pub fn health_check() -> WorkerHealth {
     WorkerHealth {
         status: "ok",
         worker: "python-jsonl",
-        protocol_version: 1,
+        protocol_version: 2,
     }
 }
 
@@ -412,11 +604,28 @@ pub async fn start_transcription_job(
     app: AppHandle,
     state: State<'_, JobRuntime>,
     account_store: State<'_, ProviderAccountStore>,
+    local_storage: State<'_, LocalStorage>,
     request: StartJobRequest,
 ) -> Result<(), String> {
     validate_request(&request)?;
     let reservation = state.reserve_start(&request.job_id)?;
-    let worker_request = build_worker_request(&request, &account_store)?;
+    let workspace = JobWorkspace::create(&request.job_id)?;
+    let (youtube_cache_path, youtube_library_path) =
+        if matches!(request.source, StartJobSource::Youtube { .. }) {
+            (
+                Some(local_storage.youtube_cache_directory()?),
+                Some(local_storage.youtube_library_directory()?),
+            )
+        } else {
+            (None, None)
+        };
+    let worker_request = build_worker_request(
+        &request,
+        &account_store,
+        workspace.path(),
+        youtube_cache_path.as_deref(),
+        youtube_library_path.as_deref(),
+    )?;
 
     let request_line = serde_json::to_string(&worker_request).map_err(|error| error.to_string())?;
     let (child, stdout, stderr) = spawn_worker(&request)?;
@@ -464,7 +673,7 @@ pub async fn start_transcription_job(
     thread::spawn(move || forward_stderr(stderr, job_id));
     let bridge_child = Arc::clone(&child);
     tauri::async_runtime::spawn_blocking(move || {
-        bridge_worker_events(app, request.job_id, bridge_child, stdout)
+        bridge_worker_events(app, request.job_id, bridge_child, stdout, workspace)
     });
     if cancel_requested {
         let mut process = child.lock().map_err(|_| "worker process lock poisoned")?;
@@ -492,18 +701,39 @@ fn kill_child(child: &mut Child) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .is_none()
     {
-        child
-            .kill()
-            .map_err(|error| format!("failed to cancel worker: {error}"))?;
+        kill_worker_process_group(child.id())?;
     }
     Ok(())
 }
 
 fn terminate_child(child: &mut Child) {
     if matches!(child.try_wait(), Ok(None)) {
-        let _ = child.kill();
+        let _ = kill_worker_process_group(child.id());
     }
     let _ = child.wait();
+}
+
+/// The worker is the leader of its own process group. Killing the group means a
+/// cancellation also terminates yt-dlp and ffmpeg descendants started by Python.
+#[cfg(unix)]
+fn kill_worker_process_group(process_id: u32) -> Result<(), String> {
+    let process_group = i32::try_from(process_id)
+        .map_err(|_| "worker process id is outside the supported range".to_string())?;
+    // A negative PID targets the process group, not the current app process.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("failed to cancel worker process group: {error}"))
+}
+
+#[cfg(not(unix))]
+fn kill_worker_process_group(_process_id: u32) -> Result<(), String> {
+    Err("worker process-group cancellation is unsupported on this platform".into())
 }
 
 fn terminate_worker(worker: &WorkerHandle) {
@@ -520,12 +750,13 @@ fn validate_request(request: &StartJobRequest) -> Result<(), String> {
         return Err("jobId must not be empty".into());
     }
     validate_translation_selection(request)?;
-    let input = Path::new(&request.input_path);
-    if !input.is_file() {
-        return Err(format!(
-            "inputPath is not a readable file: {}",
-            request.input_path
-        ));
+    match &request.source {
+        StartJobSource::LocalFile { input_path } => {
+            if !Path::new(input_path).is_file() {
+                return Err("local source inputPath is not a readable file".into());
+            }
+        }
+        StartJobSource::Youtube { url } => validate_youtube_url(url)?,
     }
     if request.task != "transcribe" {
         return Err("task must be transcribe".into());
@@ -542,14 +773,18 @@ fn validate_request(request: &StartJobRequest) -> Result<(), String> {
         if !output.is_dir() {
             return Err("outputDirectory must be an existing directory".into());
         }
+    } else if matches!(request.source, StartJobSource::Youtube { .. }) {
+        return Err("YouTube jobs require a custom output directory".into());
     }
     Ok(())
 }
 
 fn validate_translation_selection(request: &StartJobRequest) -> Result<(), String> {
+    let is_youtube = matches!(request.source, StartJobSource::Youtube { .. });
     match request.translation_provider.as_str() {
         "none" => {
-            if request.target_language != "none"
+            let expected_target = if is_youtube { "vi" } else { "none" };
+            if request.target_language != expected_target
                 || request.translation_mode != "none"
                 || request.technical_translation
                 || request.provider_account_file.is_some()
@@ -562,8 +797,10 @@ fn validate_translation_selection(request: &StartJobRequest) -> Result<(), Strin
             }
         }
         "openai_api" | "gemini_api" => {
-            if !matches!(request.target_language.as_str(), "en" | "vi") {
-                return Err("provider translation target must be en or vi".into());
+            if !(matches!(request.target_language.as_str(), "en" | "vi")
+                && (!is_youtube || request.target_language == "vi"))
+            {
+                return Err("provider translation target is not valid for this source".into());
             }
             if request.translation_mode != "technical_context" || !request.technical_translation {
                 return Err("provider translation requires technical_context mode".into());
@@ -592,12 +829,62 @@ fn validate_translation_selection(request: &StartJobRequest) -> Result<(), Strin
         }
         _ => return Err("unsupported translationProvider".into()),
     }
+    if is_youtube {
+        if request.source_language == "vi" && request.translation_provider != "none" {
+            return Err("Vietnamese YouTube sources must not use a translation provider".into());
+        }
+        if request.source_language != "vi" && request.translation_provider != "gemini_api" {
+            return Err(
+                "Non-Vietnamese YouTube sources require consented Gemini translation".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_youtube_url(value: &str) -> Result<(), String> {
+    if value.trim() != value || value.is_empty() || value.chars().count() > 2048 {
+        return Err("YouTube URL is invalid".into());
+    }
+    let parsed = Url::parse(value).map_err(|_| "YouTube URL is invalid".to_string())?;
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("YouTube URL must use credential-free HTTPS".into());
+    }
+    let host = parsed
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "YouTube URL host is missing".to_string())?;
+    match host.as_str() {
+        "youtu.be" => {
+            if parsed.path().trim_matches('/').is_empty() {
+                return Err("YouTube short URL must identify one video".into());
+            }
+        }
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" => match parsed.path() {
+            "/watch" => {
+                if parsed
+                    .query_pairs()
+                    .find(|(name, value)| name == "v" && !value.trim().is_empty())
+                    .is_none()
+                {
+                    return Err("YouTube watch URL must identify one video".into());
+                }
+            }
+            path if path.starts_with("/shorts/")
+                && path.trim_matches('/').split('/').count() == 2 => {}
+            _ => return Err("unsupported YouTube URL shape".into()),
+        },
+        _ => return Err("unsupported YouTube host".into()),
+    }
     Ok(())
 }
 
 fn build_worker_request(
     request: &StartJobRequest,
     account_store: &ProviderAccountStore,
+    workspace_path: &Path,
+    youtube_cache_path: Option<&Path>,
+    youtube_library_path: Option<&Path>,
 ) -> Result<WorkerStartJobRequest, String> {
     let provider = match request.translation_provider.as_str() {
         "openai_api" => Some(Provider::OpenAi),
@@ -618,6 +905,9 @@ fn build_worker_request(
         request: request.clone(),
         provider_api_key: runtime.as_ref().map(|account| account.api_key.clone()),
         provider_base_url: runtime.map(|account| account.base_url),
+        workspace_path: workspace_path.to_string_lossy().into_owned(),
+        youtube_cache_path: youtube_cache_path.map(|path| path.to_string_lossy().into_owned()),
+        youtube_library_path: youtube_library_path.map(|path| path.to_string_lossy().into_owned()),
     })
 }
 
@@ -638,6 +928,7 @@ fn spawn_worker(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_worker_process_group(&mut command);
         match command.spawn() {
             Ok(mut child) => {
                 let stdout = child
@@ -660,6 +951,15 @@ fn spawn_worker(
     ))
 }
 
+#[cfg(unix)]
+fn configure_worker_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_worker_process_group(_command: &mut Command) {}
+
 fn python_candidates(repo_root: &Path) -> Vec<PathBuf> {
     if let Some(configured) = env::var_os("WHISPERSUB_PYTHON") {
         return vec![PathBuf::from(configured)];
@@ -678,6 +978,7 @@ fn bridge_worker_events(
     job_id: String,
     child: Arc<Mutex<Child>>,
     stdout: std::process::ChildStdout,
+    mut workspace: JobWorkspace,
 ) {
     // React advances the queue as soon as it receives a terminal event. Keep that
     // event private until this process has exited and its registry slot is free.
@@ -706,8 +1007,8 @@ fn bridge_worker_events(
             Err(error) => {
                 pending_terminal_event =
                     Some(error_event(&job_id, "WORKER_PROTOCOL_FAILED", error, false));
-                if let Ok(mut process) = child.lock() {
-                    let _ = process.kill();
+                if let Ok(process) = child.lock() {
+                    let _ = kill_worker_process_group(process.id());
                 }
                 break;
             }
@@ -718,6 +1019,9 @@ fn bridge_worker_events(
         .lock()
         .ok()
         .and_then(|mut process| process.wait().ok());
+    if let Err(error) = workspace.cleanup() {
+        eprintln!("[worker {job_id}] workspace cleanup deferred: {error}");
+    }
     let state = app.state::<JobRuntime>();
     let cancelled = state.finish(&job_id).unwrap_or(false);
 
@@ -778,6 +1082,7 @@ fn validate_worker_event(
         "phase_changed",
         "progress",
         "segment",
+        "source_resolved",
         "completed",
         "cancelled",
         "error",
@@ -788,8 +1093,101 @@ fn validate_worker_event(
     if event.get("jobId").and_then(serde_json::Value::as_str) != Some(expected_job_id) {
         return Err("worker event jobId does not match the active job".into());
     }
+    if matches!(event_type, "phase_changed" | "progress") {
+        let phase = event
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "worker phase is missing".to_string())?;
+        if !is_supported_worker_phase(phase) {
+            return Err(format!("unsupported worker phase: {phase}"));
+        }
+    }
+    if event_type == "progress" {
+        let percent = event
+            .get("percent")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| "worker progress percent is missing".to_string())?;
+        if !(0.0..=100.0).contains(&percent) {
+            return Err("worker progress percent must be between 0 and 100".into());
+        }
+    }
+    if event_type == "source_resolved" {
+        let title = event
+            .get("displayTitle")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "worker provenance displayTitle is missing".to_string())?;
+        if title.is_empty()
+            || title.chars().count() > 80
+            || title.chars().any(|character| {
+                !(character.is_alphanumeric() || matches!(character, ' ' | '-' | '_'))
+            })
+        {
+            return Err("worker provenance displayTitle is invalid".into());
+        }
+        let origin = event
+            .get("transcriptOrigin")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "worker provenance transcriptOrigin is missing".to_string())?;
+        if !matches!(
+            origin,
+            "manual_caption"
+                | "automatic_caption"
+                | "whisper_transcribe"
+                | "whisper_translate_to_english"
+        ) {
+            return Err("worker provenance transcriptOrigin is unsupported".into());
+        }
+        let language = event
+            .get("sourceLanguage")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "worker provenance sourceLanguage is missing".to_string())?;
+        if !matches!(language, "en" | "vi") {
+            return Err("worker provenance sourceLanguage is unsupported".into());
+        }
+        if event
+            .get("cacheHit")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        {
+            return Err("worker provenance cacheHit is missing".into());
+        }
+    }
+    if event_type == "completed" {
+        if let Some(cache_status) = event.get("cacheStatus") {
+            let cache_status = cache_status
+                .as_str()
+                .ok_or_else(|| "worker cacheStatus must be a string".to_string())?;
+            if !matches!(cache_status, "hit" | "stored" | "unavailable") {
+                return Err("worker cacheStatus is unsupported".into());
+            }
+        }
+        if let Some(library_status) = event.get("libraryStatus") {
+            let library_status = library_status
+                .as_str()
+                .ok_or_else(|| "worker libraryStatus must be a string".to_string())?;
+            if !matches!(library_status, "stored" | "unavailable") {
+                return Err("worker libraryStatus is unsupported".into());
+            }
+        }
+    }
     let terminal = matches!(event_type, "completed" | "cancelled" | "error");
     Ok((event, terminal))
+}
+
+fn is_supported_worker_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "preparing"
+            | "resolving_source"
+            | "detecting_language"
+            | "fetching_subtitles"
+            | "downloading_audio"
+            | "loading_model"
+            | "extracting_audio"
+            | "transcribing"
+            | "translating"
+            | "writing_output"
+    )
 }
 
 fn error_event(job_id: &str, code: &str, message: String, retryable: bool) -> serde_json::Value {
@@ -811,9 +1209,11 @@ fn forward_stderr(stderr: std::process::ChildStderr, job_id: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_worker_request, python_candidates, route_worker_event, spawn_worker,
-        terminal_event_after_cleanup, terminate_worker, validate_output_locations_blocking,
-        validate_request, validate_worker_event, JobRuntime, StartJobRequest,
+        build_worker_request, configure_worker_process_group, is_owned_workspace,
+        kill_worker_process_group, python_candidates, route_worker_event,
+        scavenge_orphaned_workspaces, spawn_worker, terminal_event_after_cleanup, terminate_worker,
+        validate_output_locations_blocking, validate_request, validate_worker_event,
+        workspace_has_live_lease, JobRuntime, JobWorkspace, StartJobRequest, StartJobSource,
         ValidateOutputLocationsRequest, WorkerEventRoute, WorkerLifecycle,
     };
     use crate::openai_accounts::{Provider, ProviderAccountStore};
@@ -831,7 +1231,9 @@ mod tests {
         StartJobRequest {
             request_type: "start_job".into(),
             job_id: "job_01".into(),
-            input_path: input_path.into(),
+            source: StartJobSource::LocalFile {
+                input_path: input_path.into(),
+            },
             output_location_mode: "same_as_input".into(),
             output_directory: None,
             model: "small".into(),
@@ -1063,6 +1465,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_allowlisted_redacted_provenance_events() {
+        let event = validate_worker_event(
+            r#"{"type":"source_resolved","jobId":"job_01","displayTitle":"Safe title","transcriptOrigin":"manual_caption","sourceLanguage":"en","cacheHit":false}"#,
+            "job_01",
+        )
+        .expect("redacted provenance should be valid");
+        assert_eq!(event.0["transcriptOrigin"], "manual_caption");
+
+        let error = validate_worker_event(
+            r#"{"type":"source_resolved","jobId":"job_01","displayTitle":"Safe title","transcriptOrigin":"https://youtu.be/private","sourceLanguage":"en","cacheHit":false}"#,
+            "job_01",
+        )
+        .expect_err("raw source metadata must not be provenance");
+        assert!(error.contains("transcriptOrigin is unsupported"));
+    }
+
+    #[test]
     fn rejects_cross_job_event() {
         let error = validate_worker_event(
             r#"{"type":"progress","jobId":"other","phase":"transcribing","percent":1}"#,
@@ -1076,6 +1495,222 @@ mod tests {
     fn validates_local_only_request() {
         let request = sample_request("/missing.mp4");
         assert!(super::validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn rejects_youtube_jobs_without_a_custom_output_directory() {
+        let mut request = sample_request("/missing.mp4");
+        request.source = StartJobSource::Youtube {
+            url: "https://www.youtube.com/watch?v=abc123".into(),
+        };
+        request.source_language = "vi".into();
+        request.target_language = "vi".into();
+
+        let error = validate_request(&request).expect_err("YouTube output must be explicit");
+        assert!(error.contains("custom output directory"));
+    }
+
+    #[test]
+    fn injects_application_support_cache_path_only_into_youtube_worker_request() {
+        let store = ProviderAccountStore::new(
+            std::env::temp_dir().join("whispersub-cache-path-worker-request"),
+        );
+        let mut youtube = sample_request("/missing.mp4");
+        youtube.source = StartJobSource::Youtube {
+            url: "https://www.youtube.com/watch?v=abc123".into(),
+        };
+        youtube.output_location_mode = "custom_directory".into();
+        youtube.output_directory = Some("/tmp".into());
+        youtube.source_language = "vi".into();
+        youtube.target_language = "vi".into();
+
+        let worker = build_worker_request(
+            &youtube,
+            &store,
+            Path::new("/tmp/worker-workspace"),
+            Some(Path::new(
+                "/tmp/Application Support/WhisperSub/youtube-cache",
+            )),
+            Some(Path::new(
+                "/tmp/Application Support/WhisperSub/youtube-library",
+            )),
+        )
+        .expect("YouTube worker request should include the trusted cache path");
+        let worker_json = serde_json::to_string(&worker).expect("worker request should serialize");
+        assert!(worker_json.contains("youtubeCachePath"));
+        assert!(worker_json.contains("Application Support"));
+
+        let local = build_worker_request(
+            &sample_request("/missing.mp4"),
+            &store,
+            Path::new("/tmp/worker-workspace"),
+            None,
+            None,
+        )
+        .expect("local worker request should serialize without cache");
+        let local_json =
+            serde_json::to_string(&local).expect("local worker request should serialize");
+        assert!(!local_json.contains("youtubeCachePath"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_the_worker_process_group_and_descendants() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        configure_worker_process_group(&mut command);
+        let mut worker = command.spawn().expect("worker fixture should start");
+        let process_id = worker.id();
+
+        kill_worker_process_group(process_id).expect("process group should be killed");
+        worker
+            .wait()
+            .expect("worker should exit after group cancel");
+
+        let result = unsafe { libc::kill(-(process_id as i32), 0) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn job_workspace_is_marked_and_removed_only_by_its_guard() {
+        let mut workspace =
+            JobWorkspace::create("job_workspace_test").expect("workspace should be created");
+        let path = workspace.path().to_path_buf();
+        assert!(path.join(super::WORKSPACE_MARKER_NAME).is_file());
+        workspace.cleanup().expect("workspace should be cleaned");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scavenging_preserves_a_workspace_held_by_a_live_guard() {
+        if std::env::var_os("WHISPERSUB_SCAVENGE_HELPER").is_some() {
+            scavenge_orphaned_workspaces().expect("scavenging should succeed");
+            return;
+        }
+
+        let mut workspace = JobWorkspace::create("live_workspace_scavenging_test")
+            .expect("workspace should be created");
+        let path = workspace.path().to_path_buf();
+        let status =
+            Command::new(std::env::current_exe().expect("test binary path should resolve"))
+                .args([
+                    "--exact",
+                    "worker_job::tests::scavenging_preserves_a_workspace_held_by_a_live_guard",
+                    "--nocapture",
+                ])
+                .env("WHISPERSUB_SCAVENGE_HELPER", "1")
+                .status()
+                .expect("scavenger helper should run");
+
+        assert!(status.success(), "scavenger helper should succeed");
+        assert!(path.exists(), "a live workspace must not be scavenged");
+        workspace.cleanup().expect("workspace should be cleaned");
+    }
+
+    #[test]
+    fn scavenging_removes_a_legacy_marked_workspace_without_a_lease() {
+        let root = super::workspace_root();
+        fs::create_dir_all(&root).expect("workspace root should exist");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = root.join(format!("legacy-stale-workspace-{nonce}"));
+        fs::create_dir(&path).expect("legacy workspace should exist");
+        fs::write(
+            path.join(super::WORKSPACE_MARKER_NAME),
+            "whispersub-owned-v1\n",
+        )
+        .expect("legacy workspace should be marked");
+
+        scavenge_orphaned_workspaces().expect("scavenging should succeed");
+
+        assert!(
+            !path.exists(),
+            "a legacy workspace without a held lease should be scavenged"
+        );
+    }
+
+    #[test]
+    fn malformed_workspace_lease_fails_closed_during_scavenging() {
+        let root = super::workspace_root();
+        fs::create_dir_all(&root).expect("workspace root should exist");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = root.join(format!("malformed-lease-workspace-{nonce}"));
+        fs::create_dir(&path).expect("workspace should exist");
+        fs::write(
+            path.join(super::WORKSPACE_MARKER_NAME),
+            "whispersub-owned-v1\n",
+        )
+        .expect("workspace should be marked");
+        fs::create_dir(path.join(super::WORKSPACE_LEASE_NAME))
+            .expect("malformed lease should exist");
+
+        assert!(workspace_has_live_lease(&path));
+        scavenge_orphaned_workspaces().expect("scavenging should succeed");
+        assert!(path.exists(), "malformed leases must not be scavenged");
+
+        fs::remove_dir_all(path).expect("fixture should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workspace_lease_fails_closed_during_scavenging() {
+        use std::os::unix::fs::symlink;
+
+        let root = super::workspace_root();
+        fs::create_dir_all(&root).expect("workspace root should exist");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = root.join(format!("symlinked-lease-workspace-{nonce}"));
+        let target = std::env::temp_dir().join(format!("whispersub-lease-target-{nonce}"));
+        fs::create_dir(&path).expect("workspace should exist");
+        fs::write(
+            path.join(super::WORKSPACE_MARKER_NAME),
+            "whispersub-owned-v1\n",
+        )
+        .expect("workspace should be marked");
+        fs::write(&target, b"lease target").expect("lease target should exist");
+        symlink(&target, path.join(super::WORKSPACE_LEASE_NAME))
+            .expect("symlinked lease should exist");
+
+        assert!(workspace_has_live_lease(&path));
+        scavenge_orphaned_workspaces().expect("scavenging should succeed");
+        assert!(path.exists(), "symlinked leases must not be scavenged");
+
+        fs::remove_dir_all(path).expect("fixture should be removed");
+        fs::remove_file(target).expect("lease target should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_workspace_is_never_considered_owned() {
+        use std::os::unix::fs::symlink;
+
+        let root = super::workspace_root();
+        fs::create_dir_all(&root).expect("workspace root should exist");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!("whispersub-unowned-target-{nonce}"));
+        let link = root.join(format!("unowned-link-{nonce}"));
+        fs::create_dir(&target).expect("target should exist");
+        symlink(&target, &link).expect("fixture symlink should be created");
+
+        assert!(!is_owned_workspace(&link));
+
+        fs::remove_file(&link).expect("fixture symlink should be removed");
+        fs::remove_dir(&target).expect("fixture target should be removed");
     }
 
     #[test]
@@ -1114,8 +1749,14 @@ mod tests {
         assert!(!external_json.contains("providerApiKey"));
         assert!(!external_json.contains("sk-test-worker-key"));
 
-        let worker_request = build_worker_request(&request, &store)
-            .expect("worker request should resolve account runtime");
+        let worker_request = build_worker_request(
+            &request,
+            &store,
+            Path::new("/tmp/worker-workspace"),
+            None,
+            None,
+        )
+        .expect("worker request should resolve account runtime");
         let worker_json =
             serde_json::to_string(&worker_request).expect("worker request should serialize");
         assert!(worker_json.contains("providerApiKey"));
@@ -1165,16 +1806,29 @@ mod tests {
 
         validate_request(&request).expect("consented Gemini translation should be valid");
         let worker_json = serde_json::to_string(
-            &build_worker_request(&request, &store).expect("Gemini runtime should resolve"),
+            &build_worker_request(
+                &request,
+                &store,
+                Path::new("/tmp/worker-workspace"),
+                None,
+                None,
+            )
+            .expect("Gemini runtime should resolve"),
         )
         .expect("worker request should serialize");
         assert!(worker_json.contains("test-gemini-worker-key"));
         assert!(worker_json.contains("https://generativelanguage.googleapis.com"));
 
         request.provider_account_file = Some(openai.accounts[0].file_name.clone());
-        let error = build_worker_request(&request, &store)
-            .err()
-            .expect("cross-provider account must fail closed");
+        let error = build_worker_request(
+            &request,
+            &store,
+            Path::new("/tmp/worker-workspace"),
+            None,
+            None,
+        )
+        .err()
+        .expect("cross-provider account must fail closed");
         assert!(error.contains("provider") || error.contains("account"));
 
         fs::remove_dir_all(root).ok();
@@ -1199,10 +1853,18 @@ mod tests {
         let request = sample_request("/definitely/missing/Bài học.mp4");
         let (mut child, stdout, _stderr) = spawn_worker(&request).expect("worker should start");
         let mut stdin = child.stdin.take().expect("stdin should be piped");
+        let mut worker_message = serde_json::to_value(&request).expect("request should serialize");
+        worker_message
+            .as_object_mut()
+            .expect("request JSON should be an object")
+            .insert(
+                "workspacePath".into(),
+                serde_json::json!("/tmp/worker-workspace"),
+            );
         writeln!(
             stdin,
             "{}",
-            serde_json::to_string(&request).expect("request should serialize")
+            serde_json::to_string(&worker_message).expect("worker request should serialize")
         )
         .expect("request should be written");
         drop(stdin);

@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:worker": "python3 -m unittest discover -s worker/tests -v",
+    "test:worker": "worker/.venv/bin/python -m unittest discover -s worker/tests -v",
     "worker:install": "UV_CACHE_DIR=worker/.uv-cache uv sync --project worker --python 3.12 --no-install-project",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo test --manifest-path src-tauri/Cargo.toml",
     "check": "pnpm typecheck && pnpm test && pnpm test:worker && pnpm build && pnpm check:rust",

@@ -26,7 +26,7 @@ class SubtitleTest(unittest.TestCase):
             input_path.write_bytes(b"fixture")
             (root / "Bài học.srt").write_text("existing", encoding="utf-8")
             message = valid_message()
-            message["inputPath"] = str(input_path)
+            message["source"] = {"kind": "local_file", "inputPath": str(input_path)}
             message["outputFormats"] = ["srt", "vtt", "json"]
 
             outputs = write_outputs(
@@ -48,7 +48,7 @@ class SubtitleTest(unittest.TestCase):
             input_path = root / "invalid.mp4"
             input_path.write_bytes(b"fixture")
             message = valid_message()
-            message["inputPath"] = str(input_path)
+            message["source"] = {"kind": "local_file", "inputPath": str(input_path)}
 
             with self.assertRaisesRegex(WorkerError, "Invalid timestamp"):
                 write_outputs(
@@ -64,7 +64,7 @@ class SubtitleTest(unittest.TestCase):
             input_path = root / "lesson.mp4"
             input_path.write_bytes(b"fixture")
             message = valid_translation_message()
-            message["inputPath"] = str(input_path)
+            message["source"] = {"kind": "local_file", "inputPath": str(input_path)}
 
             outputs = write_outputs(
                 parse_start_job(message),
@@ -74,6 +74,91 @@ class SubtitleTest(unittest.TestCase):
             self.assertEqual(
                 [path.name for path in outputs], ["lesson.vi.srt", "lesson.vi.vtt"]
             )
+
+    def test_writes_youtube_output_with_a_resolved_safe_stem(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            message = valid_message()
+            message.update(
+                {
+                      "source": {"kind": "youtube", "url": "https://youtu.be/abc123"},
+                      "workspacePath": str(root),
+                      "youtubeCachePath": str(root / "cache"),
+                      "youtubeLibraryPath": str(root / "library"),
+                    "outputLocationMode": "custom_directory",
+                    "outputDirectory": str(root),
+                    "sourceLanguage": "vi",
+                    "targetLanguage": "vi",
+                }
+            )
+
+            outputs = write_outputs(
+                parse_start_job(message),
+                [Segment(id=0, start=0.0, end=1.0, text="Nội dung")],
+                output_stem="Bài học API-abc123def45.vi",
+            )
+
+            self.assertEqual(
+                [path.name for path in outputs],
+                ["Bài học API-abc123def45.vi.srt", "Bài học API-abc123def45.vi.vtt"],
+            )
+
+    def test_reuses_existing_srt_while_writing_only_missing_vtt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            message = valid_message()
+            message.update(
+                {
+                    "source": {"kind": "youtube", "url": "https://youtu.be/abc123"},
+                    "workspacePath": str(root),
+                    "youtubeCachePath": str(root / "cache"),
+                    "youtubeLibraryPath": str(root / "library"),
+                    "outputLocationMode": "custom_directory",
+                    "outputDirectory": str(root),
+                    "sourceLanguage": "vi",
+                    "targetLanguage": "vi",
+                }
+            )
+            existing = root / "Bài học API-abc123def45.vi.srt"
+            existing.write_text("existing", encoding="utf-8")
+
+            outputs = write_outputs(
+                parse_start_job(message),
+                [Segment(id=0, start=0.0, end=1.0, text="Nội dung")],
+                output_stem="Bài học API-abc123def45.vi",
+                existing_outputs={"srt": existing},
+            )
+
+            self.assertEqual(
+                [path.name for path in outputs],
+                ["Bài học API-abc123def45.vi.srt", "Bài học API-abc123def45.vi.vtt"],
+            )
+            self.assertEqual(existing.read_text(encoding="utf-8"), "existing")
+            self.assertFalse((root / "Bài học API-abc123def45.vi (1).srt").exists())
+
+    def test_rejects_youtube_output_stem_that_escapes_the_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            message = valid_message()
+            message.update(
+                {
+                      "source": {"kind": "youtube", "url": "https://youtu.be/abc123"},
+                      "workspacePath": str(root),
+                      "youtubeCachePath": str(root / "cache"),
+                      "youtubeLibraryPath": str(root / "library"),
+                    "outputLocationMode": "custom_directory",
+                    "outputDirectory": str(root),
+                    "sourceLanguage": "vi",
+                    "targetLanguage": "vi",
+                }
+            )
+
+            with self.assertRaisesRegex(WorkerError, "Resolved output name is invalid"):
+                write_outputs(
+                    parse_start_job(message),
+                    [Segment(id=0, start=0.0, end=1.0, text="Nội dung")],
+                    output_stem="../outside.vi",
+                )
 
 
 if __name__ == "__main__":

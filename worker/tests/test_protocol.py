@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 
 from worker.whispersub_worker.protocol import (
+    LocalFileSource,
     WorkerError,
+    YoutubeSource,
     handle_message,
     parse_start_job,
 )
@@ -13,7 +15,8 @@ def valid_message() -> dict[str, object]:
     return {
         "type": "start_job",
         "jobId": "job_01",
-        "inputPath": "/tmp/Bài học.mp4",
+        "source": {"kind": "local_file", "inputPath": "/tmp/Bài học.mp4"},
+        "workspacePath": "/tmp/whispersub-test-workspace",
         "outputLocationMode": "same_as_input",
         "outputDirectory": None,
         "model": "small",
@@ -60,7 +63,7 @@ class ProtocolTest(unittest.TestCase):
     def test_ping_reports_protocol_version(self) -> None:
         self.assertEqual(
             handle_message({"type": "ping"}),
-            [{"type": "pong", "protocolVersion": 1, "worker": "local"}],
+            [{"type": "pong", "protocolVersion": 2, "worker": "local"}],
         )
 
     def test_parses_complete_start_job_and_deduplicates_formats(self) -> None:
@@ -68,7 +71,59 @@ class ProtocolTest(unittest.TestCase):
 
         self.assertEqual(request.job_id, "job_01")
         self.assertEqual(str(request.input_path), "/tmp/Bài học.mp4")
+        self.assertIsInstance(request.source, LocalFileSource)
         self.assertEqual(request.output_formats, ("srt", "vtt"))
+
+    def test_parses_youtube_source_only_with_custom_output_directory(self) -> None:
+        message = valid_message()
+        message["source"] = {"kind": "youtube", "url": "https://youtu.be/abc123"}
+        message["outputLocationMode"] = "custom_directory"
+        message["outputDirectory"] = "/tmp"
+        message["youtubeCachePath"] = "/tmp/whispersub-youtube-cache"
+        message["youtubeLibraryPath"] = "/tmp/whispersub-youtube-library"
+        message["targetLanguage"] = "vi"
+        message["sourceLanguage"] = "vi"
+
+        request = parse_start_job(message)
+
+        self.assertIsInstance(request.source, YoutubeSource)
+        self.assertEqual(request.source.url, "https://youtu.be/abc123")
+        self.assertEqual(
+            str(request.youtube_cache_path), "/tmp/whispersub-youtube-cache"
+        )
+
+    def test_rejects_youtube_source_without_application_support_cache_path(self) -> None:
+        message = valid_message()
+        message["source"] = {"kind": "youtube", "url": "https://youtu.be/abc123"}
+        message["outputLocationMode"] = "custom_directory"
+        message["outputDirectory"] = "/tmp"
+        message["sourceLanguage"] = "vi"
+        message["targetLanguage"] = "vi"
+
+        with self.assertRaisesRegex(WorkerError, "Application Support cache path"):
+            parse_start_job(message)
+
+    def test_rejects_provider_for_vietnamese_youtube_source(self) -> None:
+        message = valid_gemini_translation_message()
+        message["source"] = {"kind": "youtube", "url": "https://youtu.be/abc123"}
+        message["outputLocationMode"] = "custom_directory"
+        message["outputDirectory"] = "/tmp"
+        message["youtubeCachePath"] = "/tmp/whispersub-youtube-cache"
+        message["youtubeLibraryPath"] = "/tmp/whispersub-youtube-library"
+        message["sourceLanguage"] = "vi"
+
+        with self.assertRaisesRegex(WorkerError, "must not use a translation provider"):
+            parse_start_job(message)
+
+    def test_rejects_youtube_source_without_workspace_path(self) -> None:
+        message = valid_message()
+        message["source"] = {"kind": "youtube", "url": "https://youtu.be/abc123"}
+        message["youtubeCachePath"] = "/tmp/whispersub-youtube-cache"
+        message["youtubeLibraryPath"] = "/tmp/whispersub-youtube-library"
+        message.pop("workspacePath")
+
+        with self.assertRaisesRegex(WorkerError, "workspacePath"):
+            parse_start_job(message)
 
     def test_requires_srt_output(self) -> None:
         message = valid_message()

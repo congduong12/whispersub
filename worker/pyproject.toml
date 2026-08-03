@@ -5,6 +5,8 @@ description = "Local openai-whisper transcription worker for WhisperSub"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "openai-whisper==20250625",
+  "pysubs2==1.8.1",
+  "yt-dlp[default]==2026.06.09",
 ]
 
 [tool.ruff]
