@@ -7,8 +7,10 @@ from typing import Any
 from worker.whispersub_worker.gemini_provider import GeminiTranslationAdapter
 from worker.whispersub_worker.openai_provider import OpenAITranslationAdapter
 from worker.whispersub_worker.protocol import WorkerError, handle_message, parse_start_job
+from worker.whispersub_worker.runtime_diagnostics import diagnostics_event
 from worker.whispersub_worker.runner import run_job
 from worker.whispersub_worker.whisper_engine import WhisperEngine
+from worker.whispersub_worker.youtube import YoutubeSourceResolver
 
 
 def emit(message: dict[str, Any]) -> None:
@@ -37,6 +39,9 @@ def main() -> int:
             for event in handle_message(message):
                 emit(event)
             return 0
+        if message.get("type") == "diagnostics":
+            emit(diagnostics_event())
+            return 0
         request = parse_start_job(message)
         translator = build_translation_adapter(request.translation_provider)
         readiness_check = (
@@ -50,6 +55,7 @@ def main() -> int:
             emit,
             translator=translator,
             readiness_check=readiness_check,
+            youtube_resolver=YoutubeSourceResolver(),
         )
         return 0
     except json.JSONDecodeError as error:

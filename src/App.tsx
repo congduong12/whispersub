@@ -4,6 +4,7 @@ import {
   CloseIcon,
   DashboardIcon,
   KeyIcon,
+  LibraryIcon,
   MenuIcon,
   SidebarToggleIcon,
   TrashIcon,
@@ -22,6 +23,7 @@ import {
 } from "./features/navigation/sidebarPreference";
 import { ApiKeysPage } from "./features/provider/ApiKeysPage";
 import { TranslationConfig } from "./features/provider/TranslationConfig";
+import { LibraryPage } from "./features/library/LibraryPage";
 
 const modelLabels: Record<string, string> = {
   tiny: "Tiny",
@@ -64,8 +66,10 @@ function App() {
     jobs,
     activeJob,
     options,
-    setOptions,
-    queueRunning,
+      setOptions,
+      queueRunning,
+        hasYoutube,
+        requiresGemini,
     targetLanguageReadiness,
     outputLocationReadiness,
     outputLocationError,
@@ -80,7 +84,10 @@ function App() {
     cancelCurrent,
     removeJob,
     clearFinished,
+    addYoutubeUrl,
   } = useJobQueue();
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [youtubeUrlError, setYoutubeUrlError] = useState<string | null>(null);
 
   useEffect(() => {
     const syncRoute = () => {
@@ -242,6 +249,9 @@ function App() {
             <DashboardIcon className="primary-nav-icon" />
             <span className="primary-nav-label">Dashboard</span>
           </a>
+          <a className="primary-nav-link" href="#library" aria-current={route.page === "library" ? "page" : undefined} aria-label="Thư viện" title="Thư viện">
+            <LibraryIcon className="primary-nav-icon" /><span className="primary-nav-label">Thư viện</span>
+          </a>
           <a
             className="primary-nav-link"
             href={route.page === "apiKeys" ? `#api-keys/${route.provider}` : "#api-keys/openai"}
@@ -307,6 +317,33 @@ function App() {
               </div>
 
                 <DropZone onChoose={() => void chooseFiles()} disabled={settingsLocked} />
+                <form
+                  className="youtube-url-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const error = addYoutubeUrl(youtubeUrl);
+                    setYoutubeUrlError(error);
+                    if (!error) setYoutubeUrl("");
+                  }}
+                >
+                  <label htmlFor="youtube-url">Hoặc thêm URL YouTube</label>
+                  <div>
+                    <input
+                      id="youtube-url"
+                      type="url"
+                      inputMode="url"
+                      placeholder="https://www.youtube.com/watch?v=…"
+                      value={youtubeUrl}
+                      onChange={(event) => setYoutubeUrl(event.target.value)}
+                      disabled={settingsLocked}
+                      aria-describedby={youtubeUrlError ? "youtube-url-error" : undefined}
+                    />
+                    <button type="submit" disabled={settingsLocked || !youtubeUrl.trim()}>
+                      Thêm URL
+                    </button>
+                  </div>
+                  {youtubeUrlError && <small id="youtube-url-error" role="alert">{youtubeUrlError}</small>}
+                </form>
                 <JobList
                   jobs={jobs}
                   autoRevealNewJobs={!queueRunning}
@@ -483,11 +520,12 @@ function App() {
                     </label>
                   </div>
 
-                  {options.targetLanguage !== "none" && (
-                    <TranslationConfig
+                    {(options.targetLanguage !== "none" || requiresGemini) && (
+                      <TranslationConfig
                       options={options}
                       setOptions={setOptions}
-                        queueRunning={settingsLocked}
+                          queueRunning={settingsLocked}
+                          providerLocked={requiresGemini}
                       />
                     )}
 
@@ -495,6 +533,7 @@ function App() {
                       options={options}
                       setOptions={setOptions}
                       queuedCount={terminalSummary.queuedCount}
+                      hasYoutube={hasYoutube}
                       disabled={settingsLocked}
                       choosingDirectory={choosingOutputDirectory}
                       error={outputLocationError}
@@ -506,6 +545,8 @@ function App() {
             </details>
           </section>
         </>
+      ) : route.page === "library" ? (
+          <LibraryPage />
       ) : (
           <ApiKeysPage provider={route.provider} disabled={settingsLocked} />
       )}

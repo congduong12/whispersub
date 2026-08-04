@@ -12,6 +12,10 @@ import type { QueuedJob } from "../lib/types";
 const statusLabels: Record<QueuedJob["status"], string> = {
   queued: "Trong hàng đợi",
   preparing: "Chuẩn bị",
+  resolving_source: "Đang kiểm tra nguồn YouTube",
+  detecting_language: "Đang xác định ngôn ngữ",
+  fetching_subtitles: "Đang lấy phụ đề",
+  downloading_audio: "Đang tải audio",
   loading_model: "Nạp model",
   extracting_audio: "Tách audio",
   transcribing: "Đang tạo phụ đề",
@@ -22,6 +26,13 @@ const statusLabels: Record<QueuedJob["status"], string> = {
   cancelled: "Đã hủy",
   failed: "Thất bại",
 };
+
+const provenanceLabels = {
+  manual_caption: "Caption do tác giả cung cấp",
+  automatic_caption: "Caption tự động từ YouTube",
+  whisper_transcribe: "Whisper chép audio local",
+  whisper_translate_to_english: "Whisper tạo English intermediate local",
+} as const;
 
 interface JobListProps {
   jobs: QueuedJob[];
@@ -207,10 +218,32 @@ export function JobList({
               {String(index + 1).padStart(2, "0")}
             </div>
             <div className="job-copy">
-              <strong title={job.inputPath}>{job.fileName}</strong>
-              <span className={`status status-${job.status}`}>
-                {statusLabels[job.status]}
-              </span>
+                  <strong
+                    title={
+                      job.source.kind === "local_file"
+                        ? job.source.inputPath
+                        : job.provenance?.displayTitle ?? job.fileName
+                    }
+                  >
+                  {job.fileName}
+                </strong>
+                <span className={`status status-${job.status}`}>
+                  {statusLabels[job.status]}
+                </span>
+                  {job.provenance && (
+                      <small className="job-provenance">
+                        {job.provenance.cacheHit
+                          ? "Dùng transcript cache local"
+                          : provenanceLabels[job.provenance.origin]}{" "}
+                        · transcript {job.provenance.sourceLanguage}
+                        {job.cacheStatus === "unavailable"
+                          ? " · không thể cập nhật cache"
+                          : ""}
+                      </small>
+                  )}
+                  {job.libraryStatus === "unavailable" && (
+                    <small className="job-provenance">Phụ đề đã tạo nhưng chưa thể lưu vào Thư viện.</small>
+                  )}
                 {job.error && (
                   <small className="job-error">
                     {job.error} {getJobFailureRecovery(job.errorCode)}
@@ -239,7 +272,7 @@ export function JobList({
                   !["queued", "completed", "cancelled", "failed"].includes(
                     job.status,
                   )
-              }
+                }
               aria-label={`Xóa ${job.fileName}`}
             >
               Xóa

@@ -1,5 +1,6 @@
 import type {
-  JobEvent,
+    JobEvent,
+    LocalStorageInfo,
   OutputLocationValidationResult,
   Provider,
   ProviderAccountState,
@@ -7,6 +8,8 @@ import type {
     ProviderConnectionTestResult,
     ProviderModelSummary,
   StartJobRequest,
+  YoutubeLibraryDetail,
+  YoutubeLibrarySummary,
 } from "./types";
 import { normalizeProviderBaseUrl } from "./providerAccounts";
 
@@ -18,10 +21,18 @@ type JobListener = (event: JobEvent) => void;
 const browserListeners = new Set<JobListener>();
 const browserTimers = new Map<string, number[]>();
 let browserProviderAccounts: ProviderAccountSummary[] = [];
+let browserOutputDirectory =
+  "/browser-preview/Documents/WhisperSub/Subtitles";
 const browserActiveAccount: Record<Provider, string | null> = {
   openai: null,
   gemini: null,
 };
+let browserLibrary: YoutubeLibraryDetail[] = [{
+  videoId: "dQw4w9WgXcQ",
+  displayTitle: "Ví dụ phụ đề tiếng Việt",
+  updatedAt: "2026-07-30T10:00:00Z",
+  versions: [{ recipeFingerprint: "a".repeat(64), createdAt: "2026-07-30T10:00:00Z", sourceLanguage: "en", transcriptOrigin: "manual_caption", exports: [{ path: "/browser-preview/Documents/WhisperSub/Subtitles/vi-du.srt", available: true }], segmentsSha256: "b".repeat(64), segments: [{ id: 0, start: 0, end: 3.5, text: "Đây là phụ đề tiếng Việt được lưu cục bộ." }, { id: 1, start: 3.5, end: 7, text: "Bạn có thể xem lại video và chọn phiên bản khác." }] }, { recipeFingerprint: "c".repeat(64), createdAt: "2026-07-29T10:00:00Z", sourceLanguage: "vi", transcriptOrigin: "whisper_transcribe", exports: [], segmentsSha256: "d".repeat(64), segments: [{ id: 0, start: 0, end: 4, text: "Phiên bản Whisper tiếng Việt." }] }],
+}];
 
 function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -33,14 +44,14 @@ function emitBrowserEvent(event: JobEvent): void {
 
 function scheduleBrowserMock(request: StartJobRequest): void {
   const translating = request.targetLanguage !== "none";
-  const inputStem = request.inputPath
-    .split(/[\\/]/)
-    .pop()
-    ?.replace(/\.[^/.]+$/, "");
+  const localInputPath = request.source.kind === "local_file" ? request.source.inputPath : null;
+  const inputStem = localInputPath
+    ? localInputPath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, "")
+    : "youtube-subtitle";
   const outputDirectory =
     request.outputLocationMode === "custom_directory" && request.outputDirectory
       ? request.outputDirectory.replace(/[\\/]+$/, "")
-      : request.inputPath.replace(/[\\/][^\\/]+$/, "");
+      : localInputPath?.replace(/[\\/][^\\/]+$/, "") ?? "";
   const outputBase = `${outputDirectory}/${inputStem ?? "subtitle"}${
     translating ? `.${request.targetLanguage}` : ""
   }`;
@@ -108,6 +119,22 @@ export async function cancelJob(jobId: string): Promise<void> {
 
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("cancel_transcription_job", { jobId });
+}
+
+export async function listYoutubeLibrary(): Promise<YoutubeLibrarySummary[]> {
+  if (!isTauriRuntime()) return browserLibrary.map(({ versions, ...item }) => ({ ...item, versionCount: versions.length }));
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<YoutubeLibrarySummary[]>("list_youtube_library");
+}
+export async function getYoutubeLibraryItem(videoId: string): Promise<YoutubeLibraryDetail> {
+  if (!isTauriRuntime()) { const item = browserLibrary.find((entry) => entry.videoId === videoId); if (!item) throw new Error("Không tìm thấy video trong Thư viện."); return item; }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<YoutubeLibraryDetail>("get_youtube_library_item", { videoId });
+}
+export async function deleteYoutubeLibraryItem(videoId: string): Promise<void> {
+  if (!isTauriRuntime()) { browserLibrary = browserLibrary.filter((entry) => entry.videoId !== videoId); return; }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("delete_youtube_library_item", { videoId });
 }
 
 function browserProviderAccountState(provider: Provider): ProviderAccountState {
@@ -380,19 +407,50 @@ export async function chooseVideoPaths(): Promise<string[]> {
   });
 }
 
-export async function chooseOutputDirectory(): Promise<string | null> {
+export async function getLocalStorageInfo(): Promise<LocalStorageInfo> {
+  if (!isTauriRuntime()) {
+    return {
+      outputDirectory: browserOutputDirectory,
+      defaultOutputDirectory:
+        "/browser-preview/Documents/WhisperSub/Subtitles",
+      usesCustomOutputDirectory:
+        browserOutputDirectory !==
+        "/browser-preview/Documents/WhisperSub/Subtitles",
+    };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LocalStorageInfo>("get_local_storage_info");
+}
+
+export async function rememberOutputDirectory(
+  directory: string,
+): Promise<LocalStorageInfo> {
+  if (!isTauriRuntime()) {
+    browserOutputDirectory = directory;
+    return getLocalStorageInfo();
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LocalStorageInfo>("remember_output_directory", { directory });
+}
+
+export async function chooseOutputDirectory(
+  initialDirectory?: string | null,
+): Promise<string | null> {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selection = await open({
       title: "Chọn thư mục lưu phụ đề",
       multiple: false,
       directory: true,
+      defaultPath: initialDirectory ?? undefined,
     });
     if (!selection) return null;
     return Array.isArray(selection) ? (selection[0] ?? null) : selection;
   }
 
-  return "/browser-preview/Subtitles";
+  return browserOutputDirectory;
 }
 
 export async function validateOutputLocations(
@@ -401,7 +459,7 @@ export async function validateOutputLocations(
   outputDirectory: string | null,
 ): Promise<OutputLocationValidationResult> {
   if (!isTauriRuntime()) {
-    if (inputPaths.length === 0) {
+    if (inputPaths.length === 0 && outputLocationMode === "same_as_input") {
       return { valid: false, code: "NO_INPUTS", path: null };
     }
     if (outputLocationMode === "custom_directory" && !outputDirectory?.trim()) {

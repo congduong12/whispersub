@@ -20,7 +20,7 @@ describe("buildLocalStartJobRequest", () => {
   it("keeps the ready target on the local transcription path", () => {
     expect(
       buildLocalStartJobRequest(
-        { jobId: "job_local", inputPath: "/video/mixed.mp4" },
+          { jobId: "job_local", source: { kind: "local_file", inputPath: "/video/mixed.mp4" } },
         baseOptions,
       ),
       ).toMatchObject({
@@ -37,7 +37,7 @@ describe("buildLocalStartJobRequest", () => {
   it("builds a consented OpenAI translation request", () => {
     expect(
       buildLocalStartJobRequest(
-        { jobId: "job_vi", inputPath: "/video/lesson.mp4" },
+          { jobId: "job_vi", source: { kind: "local_file", inputPath: "/video/lesson.mp4" } },
         {
           ...baseOptions,
           targetLanguage: "vi",
@@ -61,7 +61,7 @@ describe("buildLocalStartJobRequest", () => {
   it("applies one custom output directory to the request", () => {
     expect(
       buildLocalStartJobRequest(
-        { jobId: "job_custom_output", inputPath: "/video/lesson.mp4" },
+          { jobId: "job_custom_output", source: { kind: "local_file", inputPath: "/video/lesson.mp4" } },
         {
           ...baseOptions,
           outputLocationMode: "custom_directory",
@@ -77,7 +77,7 @@ describe("buildLocalStartJobRequest", () => {
   it("blocks a custom output request without a directory", () => {
     expect(() =>
       buildLocalStartJobRequest(
-        { jobId: "job_missing_output", inputPath: "/video/lesson.mp4" },
+          { jobId: "job_missing_output", source: { kind: "local_file", inputPath: "/video/lesson.mp4" } },
         {
           ...baseOptions,
           outputLocationMode: "custom_directory",
@@ -90,7 +90,7 @@ describe("buildLocalStartJobRequest", () => {
   it("builds a consented Gemini translation request", () => {
     expect(
       buildLocalStartJobRequest(
-        { jobId: "job_gemini", inputPath: "/video/lesson.mp4" },
+          { jobId: "job_gemini", source: { kind: "local_file", inputPath: "/video/lesson.mp4" } },
         {
           ...baseOptions,
           targetLanguage: "vi",
@@ -110,7 +110,7 @@ describe("buildLocalStartJobRequest", () => {
   it("blocks translation when consent is missing", () => {
     expect(() =>
       buildLocalStartJobRequest(
-        { jobId: "job_blocked", inputPath: "/video/mixed.mp4" },
+          { jobId: "job_blocked", source: { kind: "local_file", inputPath: "/video/mixed.mp4" } },
         {
           ...baseOptions,
           targetLanguage: "vi",
@@ -118,5 +118,52 @@ describe("buildLocalStartJobRequest", () => {
         },
       ),
     ).toThrow("Xác nhận gửi transcript text");
+  });
+
+  it("builds a direct Vietnamese YouTube request without provider runtime", () => {
+    expect(
+      buildLocalStartJobRequest(
+        { jobId: "job_youtube_vi", source: { kind: "youtube", url: "https://youtu.be/abc123" } },
+        {
+          ...baseOptions,
+          sourceLanguage: "vi",
+          outputLocationMode: "custom_directory",
+          outputDirectory: "/Users/mac/Movies/Subtitles",
+        },
+      ),
+    ).toMatchObject({ targetLanguage: "vi", translationProvider: "none" });
+  });
+
+  it("requires Gemini configuration for a non-Vietnamese YouTube request", () => {
+    expect(() =>
+      buildLocalStartJobRequest(
+        { jobId: "job_youtube_en", source: { kind: "youtube", url: "https://youtu.be/abc123" } },
+        {
+            ...baseOptions,
+            sourceLanguage: "en",
+            translationProvider: "gemini",
+            outputLocationMode: "custom_directory",
+          outputDirectory: "/Users/mac/Movies/Subtitles",
+        },
+      ),
+      ).toThrow("Chọn Gemini account");
+  });
+
+  it("rejects an OpenAI account instead of silently relabeling it as Gemini", () => {
+    expect(() =>
+      buildLocalStartJobRequest(
+        { jobId: "job_youtube_mismatch", source: { kind: "youtube", url: "https://youtu.be/abc123" } },
+        {
+          ...baseOptions,
+          sourceLanguage: "en",
+          translationProvider: "openai",
+          providerAccountFile: "openai_work_1.json",
+          providerModel: "gpt-5.6-luna",
+          translationConsent: true,
+          outputLocationMode: "custom_directory",
+          outputDirectory: "/Users/mac/Movies/Subtitles",
+        },
+      ),
+    ).toThrow("Gemini");
   });
 });

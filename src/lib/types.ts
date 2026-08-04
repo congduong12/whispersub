@@ -13,6 +13,10 @@ export const SUPPORTED_MEDIA_EXTENSIONS = [
 export type JobStatus =
   | "queued"
   | "preparing"
+  | "resolving_source"
+  | "detecting_language"
+  | "fetching_subtitles"
+  | "downloading_audio"
   | "loading_model"
   | "extracting_audio"
   | "transcribing"
@@ -32,10 +36,35 @@ export interface SubtitleSegment {
   text: string;
 }
 
+export interface YoutubeLibrarySummary {
+  videoId: string;
+  displayTitle: string;
+  updatedAt: string;
+  versionCount: number;
+}
+
+export interface YoutubeLibraryVersion {
+  recipeFingerprint: string;
+  createdAt: string;
+  sourceLanguage: "en" | "vi";
+  transcriptOrigin: string;
+  exports: Array<{ path: string; available: boolean }>;
+  segments: SubtitleSegment[];
+  segmentsSha256: string;
+}
+
+export interface YoutubeLibraryDetail extends Omit<YoutubeLibrarySummary, "versionCount"> {
+  versions: YoutubeLibraryVersion[];
+}
+
+export type JobSource =
+  | { kind: "local_file"; inputPath: string }
+  | { kind: "youtube"; url: string };
+
 export interface StartJobRequest {
   type: "start_job";
   jobId: string;
-  inputPath: string;
+  source: JobSource;
   outputLocationMode: OutputLocationMode;
   outputDirectory: string | null;
   model: "tiny" | "base" | "small" | "medium" | "turbo";
@@ -64,7 +93,25 @@ export type JobEvent =
       percent: number;
     }
   | { type: "segment"; jobId: string; segment: SubtitleSegment }
-  | { type: "completed"; jobId: string; outputs: string[] }
+  | {
+      type: "source_resolved";
+      jobId: string;
+      displayTitle: string;
+        transcriptOrigin:
+        | "manual_caption"
+        | "automatic_caption"
+        | "whisper_transcribe"
+        | "whisper_translate_to_english";
+        sourceLanguage: "en" | "vi";
+        cacheHit: boolean;
+      }
+    | {
+        type: "completed";
+        jobId: string;
+        outputs: string[];
+          cacheStatus?: "hit" | "stored" | "unavailable";
+          libraryStatus?: "stored" | "unavailable";
+      }
   | { type: "cancelled"; jobId: string }
   | {
       type: "error";
@@ -76,7 +123,7 @@ export type JobEvent =
 
 export interface QueuedJob {
   jobId: string;
-  inputPath: string;
+  source: JobSource;
   fileName: string;
   status: JobStatus;
   progress: number;
@@ -84,6 +131,20 @@ export interface QueuedJob {
   outputs: string[];
   error: string | null;
   errorCode: string | null;
+  provenance?: {
+    displayTitle: string;
+      origin: Extract<JobEvent, { type: "source_resolved" }>["transcriptOrigin"];
+      sourceLanguage: "en" | "vi";
+      cacheHit: boolean;
+    };
+    cacheStatus?: Extract<JobEvent, { type: "completed" }>["cacheStatus"];
+    libraryStatus?: Extract<JobEvent, { type: "completed" }>["libraryStatus"];
+  }
+
+export interface LocalStorageInfo {
+  outputDirectory: string;
+  defaultOutputDirectory: string;
+  usesCustomOutputDirectory: boolean;
 }
 
 export interface JobOptions {

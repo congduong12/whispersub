@@ -5,7 +5,7 @@ import { findNextValidatedQueuedJob } from "./queueBatch";
 function makeJob(jobId: string, status: JobStatus): QueuedJob {
   return {
     jobId,
-    inputPath: `/video/${jobId}.mp4`,
+    source: { kind: "local_file", inputPath: `/video/${jobId}.mp4` },
     fileName: `${jobId}.mp4`,
     status,
     progress: 0,

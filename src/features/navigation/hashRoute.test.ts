@@ -18,6 +18,11 @@ describe("WS-007 hash navigation", () => {
     });
   });
 
+  it("keeps Library on a stable hash", () => {
+    expect(parseHashRoute("#library")).toEqual({ page: "library" });
+    expect(routeHash({ page: "library" })).toBe("#library");
+  });
+
   it("serializes routes for real links and back-forward navigation", () => {
     expect(routeHash({ page: "dashboard" })).toBe("#dashboard");
     expect(routeHash({ page: "apiKeys", provider: "openai" })).toBe(

@@ -5,6 +5,7 @@ interface OutputSettingsProps {
   options: JobOptions;
   setOptions: Dispatch<SetStateAction<JobOptions>>;
   queuedCount: number;
+  hasYoutube: boolean;
   disabled: boolean;
   choosingDirectory: boolean;
   error: string | null;
@@ -15,8 +16,9 @@ interface OutputSettingsProps {
 
 export function OutputSettings({
   options,
-  setOptions,
-  queuedCount,
+    setOptions,
+    queuedCount,
+    hasYoutube,
   disabled,
   choosingDirectory,
   error,
@@ -48,13 +50,18 @@ export function OutputSettings({
           <input
             type="radio"
             name="output-location"
-            value="same_as_input"
-            checked={!usingCustomDirectory}
-            onChange={onUseSameDirectory}
+              value="same_as_input"
+              checked={!usingCustomDirectory}
+              onChange={onUseSameDirectory}
+              disabled={hasYoutube}
           />
           <span>
             <strong>Cùng thư mục với file gốc</strong>
-            <small>Mỗi phụ đề được lưu cạnh file nguồn tương ứng.</small>
+              <small>
+                {hasYoutube
+                  ? "Batch có YouTube nên cần một thư mục xuất chung."
+                  : "Mỗi phụ đề được lưu cạnh file nguồn tương ứng."}
+              </small>
           </span>
         </label>
 
@@ -90,7 +97,7 @@ export function OutputSettings({
           </button>
         </div>
 
-        {usingCustomDirectory && options.outputDirectory && (
+          {usingCustomDirectory && options.outputDirectory && (
           <div
             className="output-directory-path"
             role="status"
@@ -100,7 +107,16 @@ export function OutputSettings({
             <span aria-hidden="true">↳</span>
             <code>{options.outputDirectory}</code>
           </div>
-        )}
+          )}
+
+          {hasYoutube && (
+            <p className="output-storage-note">
+              YouTube mặc định dùng Documents/WhisperSub/Subtitles và ghi nhớ thư
+              mục bạn chọn. Transcript cache nằm trong Application Support; audio
+              tạm không được giữ lại. Documents có thể được iCloud đồng bộ tùy cấu
+              hình máy.
+            </p>
+          )}
 
         {error && (
           <p className="output-location-error" role="alert">
